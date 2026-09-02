@@ -12,6 +12,17 @@ from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 from openai import OpenAI
 
+
+# Load Opus for Discord voice decoding
+if not discord.opus.is_loaded():
+    try:
+        discord.opus.load_opus("libopus.so.0")
+        print("Opus loaded successfully: libopus.so.0")
+    except Exception as e:
+        print(f"Failed to load libopus.so.0: {e}")
+
+print(f"Discord Opus loaded: {discord.opus.is_loaded()}")
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
