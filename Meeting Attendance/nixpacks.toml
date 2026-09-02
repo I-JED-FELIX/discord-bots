@@ -1,2 +1,5 @@
 [phases.setup]
 nixPkgs = ["python313", "ffmpeg", "libopus"]
+
+[variables]
+LD_LIBRARY_PATH = "/root/.nix-profile/lib:/nix/var/nix/profiles/default/lib"
