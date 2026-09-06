@@ -19,6 +19,9 @@ lavalink:
       repository: "https://maven.lavalink.dev/releases"
       snapshot: false
 
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      snapshot: false
+
 plugins:
   lavasrc:
     providers:
