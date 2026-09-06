@@ -1,102 +1,35 @@
 import os
-import asyncio
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-import yt_dlp
+import wavelink
+
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+LAVALINK_URI = os.getenv("LAVALINK_URI")
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
 
-intents = discord.Intents.default()
+if not LAVALINK_URI:
+    raise RuntimeError("LAVALINK_URI is missing.")
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-# ============================================================
-# FROST BEATS MUSIC STATE
-# ============================================================
-
-queues = {}
-current_tracks = {}
-
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch1",
-    "source_address": "0.0.0.0",
-}
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+if not LAVALINK_PASSWORD:
+    raise RuntimeError("LAVALINK_PASSWORD is missing.")
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-async def get_track(query: str):
-    loop = asyncio.get_running_loop()
-
-    def extract():
-        return ytdl.extract_info(query, download=False)
-
-    data = await loop.run_in_executor(None, extract)
-
-    if "entries" in data:
-        entries = [entry for entry in data["entries"] if entry]
-        if not entries:
-            raise RuntimeError("No tracks found.")
-        data = entries[0]
-
-    return {
-        "title": data.get("title", "Unknown Track"),
-        "url": data.get("url"),
-        "webpage_url": data.get("webpage_url", query),
-        "thumbnail": data.get("thumbnail"),
-        "duration": data.get("duration"),
-    }
-
-
-async def connect_to_user(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member):
-        return None
-
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        return None
-
-    channel = interaction.user.voice.channel
-
-    voice_client = interaction.guild.voice_client
-
-    if voice_client:
-        if voice_client.channel != channel:
-            await voice_client.move_to(channel)
-    else:
-        voice_client = await channel.connect()
-
-    return voice_client
-
-
-def format_duration(seconds):
-    if not seconds:
+def format_duration(milliseconds: int | None) -> str:
+    if not milliseconds:
         return "Unknown"
 
-    minutes, seconds = divmod(int(seconds), 60)
+    seconds = int(milliseconds / 1000)
+
+    minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
 
     if hours:
@@ -105,155 +38,193 @@ def format_duration(seconds):
     return f"{minutes}:{seconds:02}"
 
 
-async def play_next(guild: discord.Guild):
+class WuffleBot(commands.Bot):
 
-    guild_id = guild.id
+    def __init__(self):
+        intents = discord.Intents.default()
 
-    queue = queues.get(guild_id, [])
-
-    if not queue:
-        current_tracks.pop(guild_id, None)
-        return
-
-    voice_client = guild.voice_client
-
-    if not voice_client or not voice_client.is_connected():
-        current_tracks.pop(guild_id, None)
-        return
-
-    track = queue.pop(0)
-    current_tracks[guild_id] = track
-
-    try:
-        source = discord.FFmpegPCMAudio(
-            track["url"],
-            **FFMPEG_OPTIONS
+        super().__init__(
+            command_prefix="!",
+            intents=intents
         )
 
-        def after_playing(error):
-            if error:
-                print(f"Playback error: {error}")
+    async def setup_hook(self):
 
-            asyncio.run_coroutine_threadsafe(
-                play_next(guild),
-                bot.loop
-            )
-
-        voice_client.play(
-            source,
-            after=after_playing
+        node = wavelink.Node(
+            uri=LAVALINK_URI,
+            password=LAVALINK_PASSWORD
         )
 
-    except Exception as e:
-        print(f"Failed to play track: {e}")
+        await wavelink.Pool.connect(
+            nodes=[node],
+            client=self
+        )
 
-        asyncio.run_coroutine_threadsafe(
-            play_next(guild),
-            bot.loop
+        synced = await self.tree.sync()
+
+        print(f"Synced {len(synced)} global command(s)")
+
+    async def on_ready(self):
+
+        print(f"Wuffle Puffle logged in as {self.user}")
+        print(f"Connected to {len(self.guilds)} server(s)")
+
+    async def on_wavelink_node_ready(
+        self,
+        payload: wavelink.NodeReadyEventPayload
+    ):
+
+        print(
+            f"Lavalink connected: "
+            f"{payload.node.identifier}"
         )
 
 
-# ============================================================
-# BOT EVENTS
-# ============================================================
-
-@bot.event
-async def on_ready():
-    print(f"Frost Beats logged in as {bot.user}")
-    print(f"Connected to {len(bot.guilds)} server(s)")
+bot = WuffleBot()
 
 
-@bot.event
-async def setup_hook():
-    synced = await bot.tree.sync()
-    print(f"Synced {len(synced)} global command(s)")
+async def get_player(
+    interaction: discord.Interaction
+) -> wavelink.Player | None:
+
+    if not interaction.guild:
+        return None
+
+    voice_client = interaction.guild.voice_client
+
+    if isinstance(
+        voice_client,
+        wavelink.Player
+    ):
+        return voice_client
+
+    return None
 
 
-# ============================================================
-# BASIC COMMANDS
-# ============================================================
+async def connect_to_user(
+    interaction: discord.Interaction
+) -> wavelink.Player | None:
+
+    if not interaction.guild:
+        return None
+
+    if not isinstance(
+        interaction.user,
+        discord.Member
+    ):
+        return None
+
+    if (
+        not interaction.user.voice
+        or not interaction.user.voice.channel
+    ):
+        return None
+
+    channel = interaction.user.voice.channel
+
+    player = await get_player(interaction)
+
+    if player:
+
+        if player.channel != channel:
+            await player.move_to(channel)
+
+        return player
+
+    player = await channel.connect(
+        cls=wavelink.Player
+    )
+
+    player.autoplay = (
+        wavelink.AutoPlayMode.partial
+    )
+
+    return player
+
 
 @bot.tree.command(
     name="ping",
-    description="Check whether Frost Beats is online."
+    description="Check whether Wuffle Puffle is online."
 )
-async def ping(interaction: discord.Interaction):
+async def ping(
+    interaction: discord.Interaction
+):
 
     latency = round(bot.latency * 1000)
 
     embed = discord.Embed(
-        title="❄️ Frost Beats",
+        title="🐾 Wuffle Puffle",
         description=(
             "Online and ready! 🎵\n"
             f"Latency: **{latency} ms**"
         )
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
 @bot.tree.command(
     name="join",
-    description="Ask Frost Beats to join your voice channel."
+    description="Ask Wuffle Puffle to join your voice channel."
 )
-async def join(interaction: discord.Interaction):
+async def join(
+    interaction: discord.Interaction
+):
 
-    voice_client = await connect_to_user(interaction)
+    player = await connect_to_user(
+        interaction
+    )
 
-    if not voice_client:
+    if not player:
+
         await interaction.response.send_message(
-            "❄️ Join a voice channel first.",
+            "🐾 Join a voice channel first.",
             ephemeral=True
         )
+
         return
 
     await interaction.response.send_message(
-        f"🎧 Joined **{voice_client.channel.name}**."
+        f"🎧 Joined **{player.channel.name}**."
     )
 
 
 @bot.tree.command(
     name="leave",
-    description="Disconnect Frost Beats from voice."
+    description="Disconnect Wuffle Puffle from voice."
 )
-async def leave(interaction: discord.Interaction):
+async def leave(
+    interaction: discord.Interaction
+):
 
-    voice_client = (
-        interaction.guild.voice_client
-        if interaction.guild
-        else None
-    )
+    player = await get_player(interaction)
 
-    if not voice_client:
+    if not player:
+
         await interaction.response.send_message(
             "I'm not connected to a voice channel.",
             ephemeral=True
         )
+
         return
 
-    if voice_client.is_playing():
-        voice_client.stop()
+    player.queue.clear()
 
-    queues.pop(interaction.guild.id, None)
-    current_tracks.pop(interaction.guild.id, None)
-
-    await voice_client.disconnect()
+    await player.disconnect()
 
     await interaction.response.send_message(
-        "❄️ Frost Beats disconnected."
+        "🐾 Wuffle Puffle disconnected."
     )
 
 
-# ============================================================
-# PLAY
-# ============================================================
-
 @bot.tree.command(
     name="play",
-    description="Play a song or add it to the queue."
+    description="Play a song, playlist, album, Spotify link or search."
 )
 @app_commands.describe(
-    query="Song name or URL"
+    query="Song name, YouTube URL, Spotify URL, playlist or album"
 )
 async def play(
     interaction: discord.Interaction,
@@ -261,115 +232,167 @@ async def play(
 ):
 
     if not interaction.guild:
+
         await interaction.response.send_message(
             "This command can only be used in a server.",
             ephemeral=True
         )
+
         return
 
     if (
-        not isinstance(interaction.user, discord.Member)
+        not isinstance(
+            interaction.user,
+            discord.Member
+        )
         or not interaction.user.voice
         or not interaction.user.voice.channel
     ):
+
         await interaction.response.send_message(
-            "❄️ Join a voice channel first.",
+            "🐾 Join a voice channel first.",
             ephemeral=True
         )
+
         return
 
-    # Extraction can take several seconds.
     await interaction.response.defer()
 
     try:
-        voice_client = await connect_to_user(interaction)
 
-        track = await get_track(query)
+        player = await connect_to_user(
+            interaction
+        )
 
-        if not track["url"]:
-            raise RuntimeError("No playable audio stream found.")
+        if not player:
 
-        guild_id = interaction.guild.id
+            await interaction.followup.send(
+                "❌ I couldn't connect to your voice channel.",
+                ephemeral=True
+            )
 
-        queues.setdefault(guild_id, [])
+            return
 
-        track["requested_by"] = interaction.user.display_name
+        results: wavelink.Search = (
+            await wavelink.Playable.search(
+                query
+            )
+        )
 
-        voice_client = interaction.guild.voice_client
+        if not results:
 
-        # Nothing playing -> start immediately
-        if (
-            not voice_client.is_playing()
-            and not voice_client.is_paused()
-            and guild_id not in current_tracks
+            await interaction.followup.send(
+                "❌ I couldn't find anything for that search.",
+                ephemeral=True
+            )
+
+            return
+
+        if isinstance(
+            results,
+            wavelink.Playlist
         ):
-            queues[guild_id].append(track)
 
-            await play_next(interaction.guild)
+            added = await player.queue.put_wait(
+                results
+            )
 
             embed = discord.Embed(
-                title="🎵 Now Playing",
-                description=f"**{track['title']}**"
+                title="🐾 Playlist Added",
+                description=(
+                    f"**{results.name}**\n"
+                    f"Added **{added} tracks**."
+                )
             )
 
         else:
-            queues[guild_id].append(track)
+
+            track = results[0]
+
+            await player.queue.put_wait(
+                track
+            )
 
             embed = discord.Embed(
-                title="❄️ Added to Queue",
-                description=f"**{track['title']}**"
+                title="🎵 Added to Queue",
+                description=f"**{track.title}**"
             )
 
             embed.add_field(
-                name="Position",
-                value=str(len(queues[guild_id]))
+                name="Artist",
+                value=track.author or "Unknown",
+                inline=True
             )
 
-        embed.add_field(
-            name="Duration",
-            value=format_duration(track["duration"])
+            embed.add_field(
+                name="Duration",
+                value=format_duration(
+                    track.length
+                ),
+                inline=True
+            )
+
+            embed.add_field(
+                name="Requested by",
+                value=interaction.user.mention,
+                inline=True
+            )
+
+            if track.artwork:
+
+                embed.set_thumbnail(
+                    url=track.artwork
+                )
+
+        if not player.playing:
+
+            next_track = player.queue.get()
+
+            await player.play(
+                next_track,
+                volume=50
+            )
+
+        await interaction.followup.send(
+            embed=embed
         )
-
-        embed.add_field(
-            name="Requested by",
-            value=interaction.user.mention
-        )
-
-        if track["thumbnail"]:
-            embed.set_thumbnail(url=track["thumbnail"])
-
-        await interaction.followup.send(embed=embed)
 
     except Exception as e:
 
-        print(f"/play error: {type(e).__name__}: {e}")
+        print(
+            f"/play error: "
+            f"{type(e).__name__}: {e}"
+        )
 
         await interaction.followup.send(
-            "❌ I couldn't load that track. Check the Railway logs for the exact error.",
+            "❌ I couldn't load that track. "
+            "Check the Railway logs for the exact error.",
             ephemeral=True
         )
 
-
-# ============================================================
-# PAUSE / RESUME
-# ============================================================
 
 @bot.tree.command(
     name="pause",
     description="Pause the current song."
 )
-async def pause(interaction: discord.Interaction):
+async def pause(
+    interaction: discord.Interaction
+):
 
-    voice_client = interaction.guild.voice_client if interaction.guild else None
+    player = await get_player(
+        interaction
+    )
 
-    if not voice_client or not voice_client.is_playing():
+    if not player or not player.playing:
+
         await interaction.response.send_message(
             "Nothing is currently playing.",
             ephemeral=True
         )
+
         return
 
-    voice_client.pause()
+    await player.pause(True)
 
     await interaction.response.send_message(
         "⏸️ Music paused."
@@ -380,175 +403,225 @@ async def pause(interaction: discord.Interaction):
     name="resume",
     description="Resume the paused song."
 )
-async def resume(interaction: discord.Interaction):
+async def resume(
+    interaction: discord.Interaction
+):
 
-    voice_client = interaction.guild.voice_client if interaction.guild else None
+    player = await get_player(
+        interaction
+    )
 
-    if not voice_client or not voice_client.is_paused():
+    if not player or not player.paused:
+
         await interaction.response.send_message(
             "Nothing is currently paused.",
             ephemeral=True
         )
+
         return
 
-    voice_client.resume()
+    await player.pause(False)
 
     await interaction.response.send_message(
         "▶️ Music resumed."
     )
 
 
-# ============================================================
-# SKIP
-# ============================================================
-
 @bot.tree.command(
     name="skip",
     description="Skip the current song."
 )
-async def skip(interaction: discord.Interaction):
+async def skip(
+    interaction: discord.Interaction
+):
 
-    voice_client = interaction.guild.voice_client if interaction.guild else None
+    player = await get_player(
+        interaction
+    )
 
-    if not voice_client or not (
-        voice_client.is_playing()
-        or voice_client.is_paused()
-    ):
+    if not player or not player.current:
+
         await interaction.response.send_message(
             "Nothing is currently playing.",
             ephemeral=True
         )
+
         return
 
-    voice_client.stop()
+    await player.skip(
+        force=True
+    )
 
     await interaction.response.send_message(
         "⏭️ Skipped."
     )
 
 
-# ============================================================
-# STOP
-# ============================================================
-
 @bot.tree.command(
     name="stop",
     description="Stop playback and clear the queue."
 )
-async def stop(interaction: discord.Interaction):
+async def stop(
+    interaction: discord.Interaction
+):
 
-    if not interaction.guild:
+    player = await get_player(
+        interaction
+    )
+
+    if not player:
+
+        await interaction.response.send_message(
+            "Nothing is currently playing.",
+            ephemeral=True
+        )
+
         return
 
-    voice_client = interaction.guild.voice_client
+    player.queue.clear()
 
-    queues[interaction.guild.id] = []
-    current_tracks.pop(interaction.guild.id, None)
-
-    if voice_client and (
-        voice_client.is_playing()
-        or voice_client.is_paused()
-    ):
-        voice_client.stop()
+    await player.skip(
+        force=True
+    )
 
     await interaction.response.send_message(
         "⏹️ Playback stopped and queue cleared."
     )
 
 
-# ============================================================
-# NOW PLAYING
-# ============================================================
-
 @bot.tree.command(
     name="nowplaying",
     description="Show the currently playing track."
 )
-async def nowplaying(interaction: discord.Interaction):
+async def nowplaying(
+    interaction: discord.Interaction
+):
 
-    if not interaction.guild:
-        return
+    player = await get_player(
+        interaction
+    )
 
-    track = current_tracks.get(interaction.guild.id)
+    if not player or not player.current:
 
-    if not track:
         await interaction.response.send_message(
             "Nothing is currently playing.",
             ephemeral=True
         )
+
         return
+
+    track = player.current
 
     embed = discord.Embed(
         title="🎧 Now Playing",
-        description=f"**{track['title']}**"
+        description=f"**{track.title}**"
+    )
+
+    embed.add_field(
+        name="Artist",
+        value=track.author or "Unknown",
+        inline=True
     )
 
     embed.add_field(
         name="Duration",
-        value=format_duration(track["duration"])
+        value=format_duration(
+            track.length
+        ),
+        inline=True
     )
 
     embed.add_field(
-        name="Requested by",
-        value=track.get("requested_by", "Unknown")
+        name="Source",
+        value=track.source or "Unknown",
+        inline=True
     )
 
-    if track["thumbnail"]:
-        embed.set_thumbnail(url=track["thumbnail"])
+    if track.artwork:
 
-    await interaction.response.send_message(embed=embed)
+        embed.set_thumbnail(
+            url=track.artwork
+        )
 
+    await interaction.response.send_message(
+        embed=embed
+    )
 
-# ============================================================
-# QUEUE
-# ============================================================
 
 @bot.tree.command(
     name="queue",
     description="Show the current music queue."
 )
-async def show_queue(interaction: discord.Interaction):
+async def show_queue(
+    interaction: discord.Interaction
+):
 
-    if not interaction.guild:
-        return
+    player = await get_player(
+        interaction
+    )
 
-    guild_id = interaction.guild.id
+    if not player:
 
-    current = current_tracks.get(guild_id)
-    queue = queues.get(guild_id, [])
-
-    if not current and not queue:
         await interaction.response.send_message(
             "🎵 The queue is empty."
         )
+
+        return
+
+    current = player.current
+
+    queued_tracks = list(
+        player.queue
+    )
+
+    if not current and not queued_tracks:
+
+        await interaction.response.send_message(
+            "🎵 The queue is empty."
+        )
+
         return
 
     lines = []
 
     if current:
+
         lines.append(
-            f"**Now Playing:**\n{current['title']}\n"
+            f"**Now Playing:**\n"
+            f"{current.title}\n"
         )
 
-    if queue:
-        lines.append("**Up Next:**")
+    if queued_tracks:
 
-        for index, track in enumerate(queue[:10], start=1):
+        lines.append(
+            "**Up Next:**"
+        )
+
+        for index, track in enumerate(
+            queued_tracks[:10],
+            start=1
+        ):
+
             lines.append(
-                f"`{index}.` {track['title']}"
+                f"`{index}.` "
+                f"{track.title}"
             )
 
-        if len(queue) > 10:
+        if len(queued_tracks) > 10:
+
             lines.append(
-                f"\n…and **{len(queue) - 10}** more."
+                f"\n…and "
+                f"**{len(queued_tracks) - 10}** more."
             )
 
     embed = discord.Embed(
-        title="❄️ Frost Beats Queue",
+        title="🐾 Wuffle Puffle Queue",
         description="\n".join(lines)
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
 bot.run(TOKEN)
