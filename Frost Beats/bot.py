@@ -7,7 +7,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import lavalink
-from lavalink.events import TrackStartEvent, QueueEndEvent
+from lavalink.events import TrackStartEvent, QueueEndEvent, TrackExceptionEvent
 from lavalink.errors import ClientError
 from lavalink.server import LoadType
 
@@ -372,6 +372,95 @@ class WuffleBot(
             "in guild "
             f"{event.player.guild_id}"
         )
+
+    @lavalink.listener(
+        TrackExceptionEvent
+    )
+    async def on_lavalink_track_exception(
+        self,
+        event
+    ):
+        track = event.track
+        player = event.player
+
+        original_query = track.extra.get(
+            "original_query"
+        )
+        fallback_used = track.extra.get(
+            "fallback_used",
+            False
+        )
+
+        print(
+            "Playback failed: "
+            f"{track.title} "
+            f"({getattr(track, 'source_name', 'unknown')})"
+        )
+
+        if fallback_used or not original_query:
+            print(
+                "No further fallback available."
+            )
+            return
+
+        fallback_query = (
+            f"scsearch:{original_query}"
+        )
+
+        print(
+            "Trying SoundCloud fallback: "
+            f"{fallback_query}"
+        )
+
+        try:
+            results = await (
+                player.node.get_tracks(
+                    fallback_query
+                )
+            )
+
+            if (
+                results.load_type == LoadType.EMPTY
+                or not results.tracks
+            ):
+                print(
+                    "SoundCloud fallback found "
+                    "no tracks."
+                )
+                return
+
+            fallback_track = results.tracks[0]
+            fallback_track.extra[
+                "requester"
+            ] = track.extra.get(
+                "requester"
+            )
+            fallback_track.extra[
+                "original_query"
+            ] = original_query
+            fallback_track.extra[
+                "fallback_used"
+            ] = True
+
+            # Put the replacement first so it plays
+            # before anything that was already queued.
+            player.queue.appendleft(
+                fallback_track
+            )
+
+            if not player.is_playing:
+                await player.play()
+
+            print(
+                "SoundCloud fallback queued: "
+                f"{fallback_track.title}"
+            )
+
+        except Exception as e:
+            print(
+                "SoundCloud fallback error: "
+                f"{type(e).__name__}: {e}"
+            )
 
     @lavalink.listener(
         QueueEndEvent
@@ -740,6 +829,8 @@ async def play(
             "<>"
         )
 
+        original_query = query
+
         # Normal text search:
         # use YouTube search.
         #
@@ -828,6 +919,15 @@ async def play(
                     .user
                     .id
                 )
+                track.extra[
+                    "original_query"
+                ] = (
+                    f"{track.title} "
+                    f"{track.author or ''}"
+                ).strip()
+                track.extra[
+                    "fallback_used"
+                ] = False
 
                 player.add(
                     track=track
@@ -874,6 +974,12 @@ async def play(
                 .user
                 .id
             )
+            track.extra[
+                "original_query"
+            ] = original_query
+            track.extra[
+                "fallback_used"
+            ] = False
 
             player.add(
                 track=track
