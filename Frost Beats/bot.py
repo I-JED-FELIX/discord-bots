@@ -444,7 +444,8 @@ class WuffleBot(
 
             # Put the replacement first so it plays
             # before anything that was already queued.
-            player.queue.appendleft(
+            player.queue.insert(
+                0,
                 fallback_track
             )
 
