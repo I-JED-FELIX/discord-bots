@@ -35,6 +35,10 @@ plugins:
       - WEB
       - WEBEMBEDDED
 
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "wuffle-puffle"
+
   lavasrc:
     providers:
       - "ytsearch:\"%ISRC%\""
