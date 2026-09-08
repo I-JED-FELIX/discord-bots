@@ -52,7 +52,7 @@ plugins:
       vkmusic: false
       tidal: false
       qobuz: false
-      ytdlp: true
+      ytdlp: false
       jiosaavn: false
 
     spotify:
