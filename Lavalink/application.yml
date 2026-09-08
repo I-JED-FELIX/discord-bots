@@ -27,6 +27,7 @@ plugins:
     enabled: true
     oauth:
       enabled: true
+      refreshToken: ${YOUTUBE_REFRESH_TOKEN}
     allowSearch: true
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
