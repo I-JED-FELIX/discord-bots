@@ -138,6 +138,66 @@ def build_soundcloud_search(track, original_query):
     return clean_search_text(original_query)
 
 
+
+def choose_soundcloud_fallback(tracks, original_duration):
+    """
+    Pick the SoundCloud result whose duration is closest to the
+    original track. This avoids short previews when a full-length
+    version is available.
+    """
+    if not tracks:
+        return None
+
+    if not original_duration or original_duration <= 0:
+        return tracks[0]
+
+    original_duration = int(original_duration)
+
+    usable = []
+    for candidate in tracks:
+        duration = getattr(candidate, "duration", 0) or 0
+        if duration <= 0:
+            continue
+
+        difference = abs(duration - original_duration)
+        usable.append((difference, duration, candidate))
+
+    if not usable:
+        return tracks[0]
+
+    tolerance = max(
+        15_000,
+        int(original_duration * 0.08)
+    )
+
+    close_matches = [
+        item for item in usable
+        if item[0] <= tolerance
+    ]
+
+    if close_matches:
+        close_matches.sort(key=lambda item: item[0])
+        return close_matches[0][2]
+
+    if original_duration >= 90_000:
+        minimum_reasonable = max(
+            60_000,
+            int(original_duration * 0.60)
+        )
+
+        full_length_candidates = [
+            item for item in usable
+            if item[1] >= minimum_reasonable
+        ]
+
+        if full_length_candidates:
+            full_length_candidates.sort(key=lambda item: item[0])
+            return full_length_candidates[0][2]
+
+    usable.sort(key=lambda item: item[0])
+    return usable[0][2]
+
+
 # =========================================================
 # DISCORD <-> LAVALINK VOICE CLIENT
 # =========================================================
@@ -488,7 +548,44 @@ class WuffleBot(
                 )
                 return
 
-            fallback_track = results.tracks[0]
+            original_duration = (
+                getattr(track, "duration", 0)
+                or 0
+            )
+
+            print(
+                "SoundCloud candidates: "
+                + ", ".join(
+                    (
+                        f"{candidate.title} "
+                        f"[{format_duration(getattr(candidate, 'duration', 0))}]"
+                    )
+                    for candidate in results.tracks[:5]
+                )
+            )
+
+            fallback_track = (
+                choose_soundcloud_fallback(
+                    results.tracks,
+                    original_duration
+                )
+            )
+
+            if fallback_track is None:
+                print(
+                    "No usable SoundCloud "
+                    "fallback track."
+                )
+                return
+
+            print(
+                "Selected SoundCloud fallback: "
+                f"{fallback_track.title} "
+                f"[{format_duration(getattr(fallback_track, 'duration', 0))}] "
+                f"(original "
+                f"{format_duration(original_duration)})"
+            )
+
             fallback_track.extra[
                 "requester"
             ] = track.extra.get(
