@@ -32,6 +32,7 @@ plugins:
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
     clients:
+      - TV
       - ANDROID_VR
       - WEB
     
