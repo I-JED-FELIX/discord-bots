@@ -34,7 +34,7 @@ plugins:
     clients:
       - ANDROID_VR
       - WEB
-      - WEBEMBEDDED
+    
 
     remoteCipher:
       url: "https://cipher.kikkia.dev/"
