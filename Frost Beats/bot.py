@@ -91,6 +91,53 @@ def format_duration(milliseconds):
     )
 
 
+def clean_search_text(value):
+    """Clean common video/upload noise from a title before fallback search."""
+    if not value:
+        return ""
+
+    value = re.sub(
+        r"[\(\[\{][^\)\]\}]*"
+        r"(official|music video|lyrics?|lyric video|audio|visuali[sz]er|4k|hd|remaster(?:ed)?|video)"
+        r"[^\)\]\}]*[\)\]\}]",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    value = re.sub(
+        r"\s*[-–—|]\s*"
+        r"(official\s+)?"
+        r"(music\s+)?"
+        r"(video|audio|lyrics?|lyric\s+video|visuali[sz]er)"
+        r"\s*$",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    value = re.sub(r"\s+", " ", value).strip(" -–—|")
+    return value
+
+
+def build_soundcloud_search(track, original_query):
+    title = clean_search_text(
+        getattr(track, "title", "") or ""
+    )
+    author = clean_search_text(
+        getattr(track, "author", "") or ""
+    )
+
+    # Prefer Lavalink's resolved metadata over the user's raw search.
+    if title and author:
+        return f"{title} {author}".strip()
+
+    if title:
+        return title
+
+    return clean_search_text(original_query)
+
+
 # =========================================================
 # DISCORD <-> LAVALINK VOICE CLIENT
 # =========================================================
@@ -403,8 +450,20 @@ class WuffleBot(
             )
             return
 
+        fallback_terms = build_soundcloud_search(
+            track,
+            original_query
+        )
+
+        if not fallback_terms:
+            print(
+                "No usable metadata for "
+                "SoundCloud fallback."
+            )
+            return
+
         fallback_query = (
-            f"scsearch:{original_query}"
+            f"scsearch:{fallback_terms}"
         )
 
         print(
@@ -978,6 +1037,12 @@ async def play(
             track.extra[
                 "original_query"
             ] = original_query
+            track.extra[
+                "resolved_search"
+            ] = (
+                f"{track.title} "
+                f"{track.author or ''}"
+            ).strip()
             track.extra[
                 "fallback_used"
             ] = False
