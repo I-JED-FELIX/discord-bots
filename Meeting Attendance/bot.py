@@ -434,6 +434,79 @@ async def on_ready():
 
 
 
+async def get_guild_plan(guild_id: int) -> str:
+    """Return FREE or PRO for a Discord server."""
+    if db_pool is None:
+        return "FREE"
+
+    await ensure_guild(guild_id)
+
+    plan = await db_pool.fetchval(
+        "SELECT plan FROM guilds WHERE guild_id = $1",
+        guild_id,
+    )
+    return (plan or "FREE").upper()
+
+
+async def is_pro_guild(guild_id: int) -> bool:
+    return await get_guild_plan(guild_id) == "PRO"
+
+
+async def require_pro(interaction: discord.Interaction) -> bool:
+    """Return True for PRO guilds; otherwise show the upgrade message."""
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used inside a server.",
+            ephemeral=True,
+        )
+        return False
+
+    if await is_pro_guild(interaction.guild.id):
+        return True
+
+    await interaction.response.send_message(
+        "❄️ **Frost Scribe Pro required**\n\n"
+        "Recording, transcription, and AI meeting summaries are Pro features "
+        "because they use paid processing credits.\n\n"
+        "Free features remain available: scheduling, reminders, and attendance tracking.",
+        ephemeral=True,
+    )
+    return False
+
+
+plan_group = app_commands.Group(
+    name="plan",
+    description="View Frost Scribe plan information",
+)
+
+
+@plan_group.command(
+    name="status",
+    description="Show this server's Frost Scribe plan",
+)
+async def plan_status(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    plan = await get_guild_plan(interaction.guild.id)
+
+    if plan == "PRO":
+        await interaction.response.send_message(
+            "💎 **Frost Scribe Pro**\n"
+            "Recording, transcription, and AI meeting summaries are enabled."
+        )
+    else:
+        await interaction.response.send_message(
+            "❄️ **Frost Scribe Free**\n"
+            "Scheduling, reminders, and attendance tracking are enabled.\n\n"
+            "💎 **Pro** adds recording, transcription, and AI meeting summaries."
+        )
+
+
 attendance_group = app_commands.Group(
     name="attendance",
     description="Free attendance tracking without recording",
@@ -1127,6 +1200,9 @@ async def meeting_start(
     name: str,
     channel: discord.VoiceChannel | None = None,
 ):
+    if not await require_pro(interaction):
+        return
+
     if interaction.guild is None:
         await interaction.response.send_message(
             "This command must be used inside a server.",
@@ -1240,6 +1316,9 @@ async def meeting_start(
     description="Show attendance and recording status",
 )
 async def meeting_status(interaction: discord.Interaction):
+    if not await require_pro(interaction):
+        return
+
     if (
         interaction.guild is None
         or interaction.guild.id not in active_meetings
@@ -1304,6 +1383,9 @@ async def meeting_status(interaction: discord.Interaction):
     ),
 )
 async def meeting_end(interaction: discord.Interaction):
+    if not await require_pro(interaction):
+        return
+
     if (
         interaction.guild is None
         or interaction.guild.id not in active_meetings
@@ -1525,6 +1607,7 @@ async def on_voice_state_update(
             end_session(session, member)
 
 
+bot.tree.add_command(plan_group)
 bot.tree.add_command(attendance_group)
 bot.tree.add_command(schedule_group)
 bot.tree.add_command(meeting_group)
