@@ -443,115 +443,252 @@ def parse_scheduled_time(date_text, time_text, timezone_name):
 def discord_time(dt, style="F"):
     return f"<t:{int(dt.timestamp())}:{style}>"
 
-@schedule_group.command(
-    name="create",
-    description="Schedule a meeting with automatic reminders",
-)
-@app_commands.describe(
-    name="Meeting name",
-    date="Date in YYYY-MM-DD format",
-    time="Time in 24-hour HH:MM format",
-    timezone_name="Start typing a timezone, e.g. Asia/Kolkata",
-    reminder_channel="Text channel where reminders will be posted",
-    role="Role to notify",
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def schedule_create(
-    interaction: discord.Interaction,
-    name: str,
-    date: str,
-    time: str,
-    timezone_name: str,
-    reminder_channel: discord.TextChannel,
-    role: discord.Role | None = None,
-):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "Use this command inside a server.",
-            ephemeral=True,
-        )
-        return
+class ScheduleDraft:
+    def __init__(self, user_id: int, guild_id: int):
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.name = None
+        self.date = None
+        self.time = None
+        self.timezone_name = "Asia/Kolkata"
+        self.reminder_channel_id = None
+        self.role_ids = []
 
-    if db_pool is None:
-        await interaction.response.send_message(
-            "The scheduling database is not available right now.",
-            ephemeral=True,
-        )
-        return
 
-    try:
-        scheduled_at = parse_scheduled_time(date, time, timezone_name)
-    except ValueError as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
+schedule_drafts = {}
 
-    if scheduled_at <= utcnow():
-        await interaction.response.send_message(
-            "❌ Meeting time must be in the future.",
-            ephemeral=True,
-        )
-        return
 
-    tag_text = role.mention if role else ""
+def schedule_panel_embed(draft: ScheduleDraft):
+    channel_text = f"<#{draft.reminder_channel_id}>" if draft.reminder_channel_id else "Not set"
+    role_text = " ".join(f"<@&{rid}>" for rid in draft.role_ids) if draft.role_ids else "None"
 
-    meeting_id = await db_pool.fetchval(
-        """
-        INSERT INTO scheduled_meetings
-        (guild_id,name,scheduled_at,reminder_channel_id,tag_text,created_by)
-        VALUES($1,$2,$3,$4,$5,$6) RETURNING id
-        """,
-        interaction.guild.id,
-        name.strip(),
-        scheduled_at,
-        reminder_channel.id,
-        tag_text,
-        interaction.user.id,
+    embed = discord.Embed(
+        title="❄️ Frost Scribe — Schedule Meeting",
+        description="Configure the meeting, then press **Schedule Meeting**.",
     )
+    embed.add_field(name="Meeting Name", value=draft.name or "Not set", inline=False)
+    embed.add_field(name="Date", value=draft.date or "Not set", inline=True)
+    embed.add_field(name="Time", value=draft.time or "Not set", inline=True)
+    embed.add_field(name="Timezone", value=draft.timezone_name, inline=False)
+    embed.add_field(name="Reminder Channel", value=channel_text, inline=False)
+    embed.add_field(name="Notify Roles", value=role_text, inline=False)
+    return embed
+
+
+class NameModal(discord.ui.Modal, title="Meeting Name"):
+    meeting_name = discord.ui.TextInput(label="Meeting name", placeholder="Example: AOO Strategy Meeting", max_length=100)
+
+    def __init__(self, draft):
+        super().__init__()
+        self.draft = draft
+        if draft.name:
+            self.meeting_name.default = draft.name
+
+    async def on_submit(self, interaction):
+        self.draft.name = str(self.meeting_name).strip()
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class DateModal(discord.ui.Modal, title="Meeting Date"):
+    meeting_date = discord.ui.TextInput(label="Date", placeholder="YYYY-MM-DD", max_length=10)
+
+    def __init__(self, draft):
+        super().__init__()
+        self.draft = draft
+        if draft.date:
+            self.meeting_date.default = draft.date
+
+    async def on_submit(self, interaction):
+        value = str(self.meeting_date).strip()
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            await interaction.response.send_message("❌ Use date format `YYYY-MM-DD`.", ephemeral=True)
+            return
+        self.draft.date = value
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class TimeModal(discord.ui.Modal, title="Meeting Time"):
+    meeting_time = discord.ui.TextInput(label="Time", placeholder="24-hour HH:MM", max_length=5)
+
+    def __init__(self, draft):
+        super().__init__()
+        self.draft = draft
+        if draft.time:
+            self.meeting_time.default = draft.time
+
+    async def on_submit(self, interaction):
+        value = str(self.meeting_time).strip()
+        try:
+            datetime.strptime(value, "%H:%M")
+        except ValueError:
+            await interaction.response.send_message("❌ Use 24-hour time format `HH:MM`.", ephemeral=True)
+            return
+        self.draft.time = value
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class TimezoneModal(discord.ui.Modal, title="Meeting Timezone"):
+    timezone_name = discord.ui.TextInput(label="Timezone", placeholder="Example: Asia/Kolkata", max_length=64)
+
+    def __init__(self, draft):
+        super().__init__()
+        self.draft = draft
+        self.timezone_name.default = draft.timezone_name
+
+    async def on_submit(self, interaction):
+        value = str(self.timezone_name).strip()
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError:
+            await interaction.response.send_message(
+                "❌ Unknown timezone. Example: `Asia/Kolkata`, `Asia/Manila`, or `America/New_York`.",
+                ephemeral=True,
+            )
+            return
+        self.draft.timezone_name = value
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class ReminderChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, draft):
+        self.draft = draft
+        super().__init__(
+            placeholder="Select reminder channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction):
+        self.draft.reminder_channel_id = self.values[0].id
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class NotifyRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, draft):
+        self.draft = draft
+        super().__init__(placeholder="Select role(s) to notify", min_values=0, max_values=5)
+
+    async def callback(self, interaction):
+        self.draft.role_ids = [role.id for role in self.values]
+        await interaction.response.edit_message(embed=schedule_panel_embed(self.draft), view=SchedulePanelView(self.draft))
+
+
+class SchedulePanelView(discord.ui.View):
+    def __init__(self, draft):
+        super().__init__(timeout=900)
+        self.draft = draft
+        self.add_item(ReminderChannelSelect(draft))
+        self.add_item(NotifyRoleSelect(draft))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.draft.user_id:
+            await interaction.response.send_message("This scheduling panel belongs to another user.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Name", emoji="📝", style=discord.ButtonStyle.secondary, row=2)
+    async def name_button(self, interaction, button):
+        await interaction.response.send_modal(NameModal(self.draft))
+
+    @discord.ui.button(label="Date", emoji="📅", style=discord.ButtonStyle.secondary, row=2)
+    async def date_button(self, interaction, button):
+        await interaction.response.send_modal(DateModal(self.draft))
+
+    @discord.ui.button(label="Time", emoji="🕐", style=discord.ButtonStyle.secondary, row=2)
+    async def time_button(self, interaction, button):
+        await interaction.response.send_modal(TimeModal(self.draft))
+
+    @discord.ui.button(label="Timezone", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
+    async def timezone_button(self, interaction, button):
+        await interaction.response.send_modal(TimezoneModal(self.draft))
+
+    @discord.ui.button(label="Schedule Meeting", emoji="✅", style=discord.ButtonStyle.success, row=3)
+    async def schedule_button(self, interaction, button):
+        missing = []
+        if not self.draft.name: missing.append("meeting name")
+        if not self.draft.date: missing.append("date")
+        if not self.draft.time: missing.append("time")
+        if not self.draft.reminder_channel_id: missing.append("reminder channel")
+
+        if missing:
+            await interaction.response.send_message("❌ Missing: " + ", ".join(missing), ephemeral=True)
+            return
+
+        try:
+            scheduled_at = parse_scheduled_time(
+                self.draft.date,
+                self.draft.time,
+                self.draft.timezone_name,
+            )
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+        if scheduled_at <= utcnow():
+            await interaction.response.send_message("❌ Meeting time must be in the future.", ephemeral=True)
+            return
+
+        tag_text = " ".join(f"<@&{rid}>" for rid in self.draft.role_ids)
+
+        meeting_id = await db_pool.fetchval(
+            """
+            INSERT INTO scheduled_meetings
+            (guild_id,name,scheduled_at,reminder_channel_id,tag_text,created_by)
+            VALUES($1,$2,$3,$4,$5,$6)
+            RETURNING id
+            """,
+            interaction.guild_id,
+            self.draft.name,
+            scheduled_at,
+            self.draft.reminder_channel_id,
+            tag_text,
+            interaction.user.id,
+        )
+
+        schedule_drafts.pop((interaction.guild_id, interaction.user.id), None)
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"📅 Meeting Scheduled — #{meeting_id}",
+                description=(
+                    f"**{self.draft.name}**\n"
+                    f"🕒 {discord_time(scheduled_at)} ({discord_time(scheduled_at, 'R')})\n"
+                    f"🌍 `{self.draft.timezone_name}`\n"
+                    f"📣 Reminders: **1 hour** and **30 minutes** before\n"
+                    f"💬 <#{self.draft.reminder_channel_id}>\n"
+                    f"🏷️ {tag_text or 'No roles selected'}"
+                ),
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.danger, row=3)
+    async def cancel_button(self, interaction, button):
+        schedule_drafts.pop((interaction.guild_id, interaction.user.id), None)
+        await interaction.response.edit_message(content="❌ Scheduling cancelled.", embed=None, view=None)
+
+
+@schedule_group.command(name="create", description="Open the interactive meeting scheduler")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def schedule_create(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+        return
+    if db_pool is None:
+        await interaction.response.send_message("The scheduling database is not available right now.", ephemeral=True)
+        return
+
+    draft = ScheduleDraft(interaction.user.id, interaction.guild.id)
+    schedule_drafts[(interaction.guild.id, interaction.user.id)] = draft
 
     await interaction.response.send_message(
-        f"📅 **Meeting scheduled — #{meeting_id}**\n"
-        f"**{name.strip()}**\n"
-        f"🕒 {discord_time(scheduled_at)} ({discord_time(scheduled_at,'R')})\n"
-        f"🌍 Timezone: `{timezone_name}`\n"
-        f"📣 Reminders: **1 hour** and **30 minutes** before\n"
-        f"💬 {reminder_channel.mention}\n"
-        f"🏷️ {tag_text or 'No role selected'}"
+        embed=schedule_panel_embed(draft),
+        view=SchedulePanelView(draft),
+        ephemeral=True,
     )
-
-
-async def timezone_autocomplete(
-    interaction: discord.Interaction,
-    current: str,
-):
-    query = (current or "").strip().lower()
-    zones = sorted(available_timezones())
-
-    if query:
-        starts = [z for z in zones if z.lower().startswith(query)]
-        contains = [z for z in zones if query in z.lower() and z not in starts]
-        matches = starts + contains
-    else:
-        preferred = [
-            "Asia/Kolkata",
-            "Asia/Manila",
-            "Asia/Singapore",
-            "Asia/Dubai",
-            "Europe/London",
-            "America/New_York",
-            "America/Chicago",
-            "America/Los_Angeles",
-            "Australia/Sydney",
-            "UTC",
-        ]
-        matches = [z for z in preferred if z in zones]
-
-    return [
-        app_commands.Choice(name=z, value=z)
-        for z in matches[:25]
-    ]
-
-
-schedule_create.autocomplete("timezone_name")(timezone_autocomplete)
 
 
 @schedule_group.command(name="list", description="List upcoming meetings")
