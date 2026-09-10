@@ -6,6 +6,7 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
+import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands, voice_recv
@@ -28,6 +29,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -44,6 +46,75 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # One active meeting per Discord server.
 active_meetings = {}
+
+# PostgreSQL connection pool. Railway supplies DATABASE_URL.
+db_pool = None
+
+
+async def init_database():
+    """Connect to PostgreSQL and create Frost Scribe's core tables."""
+    global db_pool
+
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is missing. Add the Railway Postgres reference "
+            "to the Frost Scribe service."
+        )
+
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
+    )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS guilds (
+                guild_id BIGINT PRIMARY KEY,
+                plan TEXT NOT NULL DEFAULT 'FREE'
+                    CHECK (plan IN ('FREE', 'PRO')),
+                subscription_status TEXT NOT NULL DEFAULT 'inactive',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_meetings (
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                scheduled_at TIMESTAMPTZ NOT NULL,
+                reminder_channel_id BIGINT NOT NULL,
+                tag_text TEXT,
+                created_by BIGINT NOT NULL,
+                reminder_1h_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                reminder_30m_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scheduled_meetings_due
+            ON scheduled_meetings (cancelled, scheduled_at)
+        """)
+
+    print("PostgreSQL connected.")
+    print("Database tables ready: guilds, scheduled_meetings")
+
+
+async def ensure_guild(guild_id: int):
+    """Ensure a Discord server has a FREE plan row."""
+    if db_pool is None:
+        return
+
+    await db_pool.execute("""
+        INSERT INTO guilds (guild_id)
+        VALUES ($1)
+        ON CONFLICT (guild_id) DO NOTHING
+    """, guild_id)
 
 
 def utcnow():
@@ -322,6 +393,19 @@ TRANSCRIPT:
 
 @bot.event
 async def on_ready():
+    global db_pool
+
+    try:
+        if db_pool is None:
+            await init_database()
+
+        for connected_guild in bot.guilds:
+            await ensure_guild(connected_guild.id)
+
+    except Exception as e:
+        print(f"Database initialization failed: {type(e).__name__}: {e}")
+        return
+
     try:
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
