@@ -4,7 +4,7 @@ import asyncio
 import threading
 import wave
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from pathlib import Path
 
 import asyncpg
@@ -443,29 +443,116 @@ def parse_scheduled_time(date_text, time_text, timezone_name):
 def discord_time(dt, style="F"):
     return f"<t:{int(dt.timestamp())}:{style}>"
 
-@schedule_group.command(name="create", description="Schedule a meeting with 1-hour and 30-minute reminders")
-@app_commands.describe(name="Meeting name", date="YYYY-MM-DD", time="24-hour HH:MM", timezone_name="Example: Asia/Kolkata", reminder_channel="Channel for reminders", tags="Role/user mentions")
+@schedule_group.command(
+    name="create",
+    description="Schedule a meeting with automatic reminders",
+)
+@app_commands.describe(
+    name="Meeting name",
+    date="Date in YYYY-MM-DD format",
+    time="Time in 24-hour HH:MM format",
+    timezone_name="Start typing a timezone, e.g. Asia/Kolkata",
+    reminder_channel="Text channel where reminders will be posted",
+    role="Role to notify",
+)
 @app_commands.checks.has_permissions(manage_guild=True)
-async def schedule_create(interaction: discord.Interaction, name: str, date: str, time: str, timezone_name: str, reminder_channel: discord.TextChannel, tags: str = ""):
+async def schedule_create(
+    interaction: discord.Interaction,
+    name: str,
+    date: str,
+    time: str,
+    timezone_name: str,
+    reminder_channel: discord.TextChannel,
+    role: discord.Role | None = None,
+):
     if interaction.guild is None:
-        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if db_pool is None:
+        await interaction.response.send_message(
+            "The scheduling database is not available right now.",
+            ephemeral=True,
+        )
+        return
+
     try:
         scheduled_at = parse_scheduled_time(date, time, timezone_name)
     except ValueError as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True); return
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
     if scheduled_at <= utcnow():
-        await interaction.response.send_message("❌ Meeting time must be in the future.", ephemeral=True); return
-    meeting_id = await db_pool.fetchval("""
+        await interaction.response.send_message(
+            "❌ Meeting time must be in the future.",
+            ephemeral=True,
+        )
+        return
+
+    tag_text = role.mention if role else ""
+
+    meeting_id = await db_pool.fetchval(
+        """
         INSERT INTO scheduled_meetings
         (guild_id,name,scheduled_at,reminder_channel_id,tag_text,created_by)
         VALUES($1,$2,$3,$4,$5,$6) RETURNING id
-    """, interaction.guild.id, name.strip(), scheduled_at, reminder_channel.id, tags.strip(), interaction.user.id)
-    await interaction.response.send_message(
-        f"📅 **Meeting scheduled — #{meeting_id}**\n**{name.strip()}**\n"
-        f"🕒 {discord_time(scheduled_at)} ({discord_time(scheduled_at,'R')})\n"
-        f"📣 Reminders: **1 hour** and **30 minutes** before\n"
-        f"💬 {reminder_channel.mention}\n🏷️ {tags.strip() or 'None'}"
+        """,
+        interaction.guild.id,
+        name.strip(),
+        scheduled_at,
+        reminder_channel.id,
+        tag_text,
+        interaction.user.id,
     )
+
+    await interaction.response.send_message(
+        f"📅 **Meeting scheduled — #{meeting_id}**\n"
+        f"**{name.strip()}**\n"
+        f"🕒 {discord_time(scheduled_at)} ({discord_time(scheduled_at,'R')})\n"
+        f"🌍 Timezone: `{timezone_name}`\n"
+        f"📣 Reminders: **1 hour** and **30 minutes** before\n"
+        f"💬 {reminder_channel.mention}\n"
+        f"🏷️ {tag_text or 'No role selected'}"
+    )
+
+
+async def timezone_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    query = (current or "").strip().lower()
+    zones = sorted(available_timezones())
+
+    if query:
+        starts = [z for z in zones if z.lower().startswith(query)]
+        contains = [z for z in zones if query in z.lower() and z not in starts]
+        matches = starts + contains
+    else:
+        preferred = [
+            "Asia/Kolkata",
+            "Asia/Manila",
+            "Asia/Singapore",
+            "Asia/Dubai",
+            "Europe/London",
+            "America/New_York",
+            "America/Chicago",
+            "America/Los_Angeles",
+            "Australia/Sydney",
+            "UTC",
+        ]
+        matches = [z for z in preferred if z in zones]
+
+    return [
+        app_commands.Choice(name=z, value=z)
+        for z in matches[:25]
+    ]
+
+
+schedule_create.autocomplete("timezone_name")(timezone_autocomplete)
+
 
 @schedule_group.command(name="list", description="List upcoming meetings")
 async def schedule_list(interaction: discord.Interaction):
@@ -525,11 +612,35 @@ async def scheduled_reminder_worker():
         due30=(not row["reminder_30m_sent"] and row["scheduled_at"]<=now+timedelta(minutes=30))
         due60=(not row["reminder_1h_sent"] and row["scheduled_at"]<=now+timedelta(hours=1))
         if due30:
-            if await send_schedule_reminder(row,"30 minutes"):
-                await db_pool.execute("UPDATE scheduled_meetings SET reminder_1h_sent=TRUE, reminder_30m_sent=TRUE WHERE id=$1",row["id"])
+            remaining_seconds = max(
+                0,
+                (row["scheduled_at"] - now).total_seconds()
+            )
+            remaining_minutes = max(
+                1,
+                int(round(remaining_seconds / 60))
+            )
+            label = (
+                "30 minutes"
+                if 28 <= remaining_minutes <= 32
+                else f"{remaining_minutes} minute"
+                + ("" if remaining_minutes == 1 else "s")
+            )
+
+            if await send_schedule_reminder(row, label):
+                await db_pool.execute(
+                    "UPDATE scheduled_meetings "
+                    "SET reminder_1h_sent=TRUE, reminder_30m_sent=TRUE "
+                    "WHERE id=$1",
+                    row["id"],
+                )
         elif due60:
             if await send_schedule_reminder(row,"1 hour"):
-                await db_pool.execute("UPDATE scheduled_meetings SET reminder_1h_sent=TRUE WHERE id=$1",row["id"])
+                await db_pool.execute(
+                    "UPDATE scheduled_meetings "
+                    "SET reminder_1h_sent=TRUE WHERE id=$1",
+                    row["id"],
+                )
 
 @scheduled_reminder_worker.before_loop
 async def before_scheduled_reminder_worker():
