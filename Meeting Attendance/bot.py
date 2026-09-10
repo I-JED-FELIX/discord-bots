@@ -38,6 +38,9 @@ DATA_DIR.mkdir(exist_ok=True)
 RECORDINGS_DIR = DATA_DIR / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
+ATTENDANCE_DIR = DATA_DIR / "attendance"
+ATTENDANCE_DIR.mkdir(exist_ok=True)
+
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -45,8 +48,11 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# One active meeting per Discord server.
+# One active recorded meeting per Discord server.
 active_meetings = {}
+
+# One active attendance-only session per Discord server.
+active_attendance = {}
 
 # PostgreSQL connection pool. Railway supplies DATABASE_URL.
 db_pool = None
@@ -425,6 +431,320 @@ async def on_ready():
         print(f"Command sync failed: {e}")
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
+
+
+
+attendance_group = app_commands.Group(
+    name="attendance",
+    description="Free attendance tracking without recording",
+)
+
+
+def build_attendance_rows(session, ended_at):
+    session_seconds = max(
+        1,
+        (ended_at - session["started_at"]).total_seconds(),
+    )
+
+    rows = []
+
+    for uid, participant in session["participants"].items():
+        seconds = participant["seconds"]
+
+        if participant["joined_at"] is not None:
+            seconds += (
+                ended_at - participant["joined_at"]
+            ).total_seconds()
+
+        attendance_pct = min(
+            100.0,
+            (seconds / session_seconds) * 100,
+        )
+
+        rows.append(
+            {
+                "discord_user_id": uid,
+                "display_name": participant["display_name"],
+                "username": participant["username"],
+                "meeting_name": session["name"],
+                "voice_channel": session["channel_name"],
+                "meeting_started_utc": session["started_at"].isoformat(),
+                "meeting_ended_utc": ended_at.isoformat(),
+                "minutes_attended": round(seconds / 60, 2),
+                "attendance_percent": round(attendance_pct, 2),
+            }
+        )
+
+    rows.sort(
+        key=lambda row: row["minutes_attended"],
+        reverse=True,
+    )
+
+    return rows, session_seconds
+
+
+def write_attendance_csv(session, rows, ended_at):
+    stamp = ended_at.strftime("%Y-%m-%d_%H-%M-%S")
+    filename = (
+        f"{safe_filename(session['name'])}_{stamp}.csv"
+    )
+    path = ATTENDANCE_DIR / filename
+
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "discord_user_id",
+                "display_name",
+                "username",
+                "meeting_name",
+                "voice_channel",
+                "meeting_started_utc",
+                "meeting_ended_utc",
+                "minutes_attended",
+                "attendance_percent",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return path
+
+
+@attendance_group.command(
+    name="start",
+    description="Start attendance tracking without recording audio",
+)
+@app_commands.describe(
+    name="Attendance session name",
+    channel="Voice channel to track; leave blank to use your current channel",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def attendance_start(
+    interaction: discord.Interaction,
+    name: str,
+    channel: discord.VoiceChannel | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    guild_id = interaction.guild.id
+
+    if guild_id in active_attendance:
+        current = active_attendance[guild_id]
+        await interaction.response.send_message(
+            f"Attendance is already active: **{current['name']}** "
+            f"in <#{current['channel_id']}>.\n"
+            "Stop it first with `/attendance stop`.",
+            ephemeral=True,
+        )
+        return
+
+    if guild_id in active_meetings:
+        current = active_meetings[guild_id]
+        await interaction.response.send_message(
+            f"🔴 A recorded meeting is already active: "
+            f"**{current['name']}** in <#{current['channel_id']}>.\n"
+            "Recording already includes attendance tracking.",
+            ephemeral=True,
+        )
+        return
+
+    if channel is None:
+        member = interaction.guild.get_member(
+            interaction.user.id
+        )
+
+        if (
+            member is None
+            or member.voice is None
+            or member.voice.channel is None
+        ):
+            await interaction.response.send_message(
+                "Join the voice channel first, or specify the "
+                "`channel` option.",
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(
+            member.voice.channel,
+            discord.VoiceChannel,
+        ):
+            await interaction.response.send_message(
+                "Please use a standard Discord voice channel.",
+                ephemeral=True,
+            )
+            return
+
+        channel = member.voice.channel
+
+    started_at = utcnow()
+
+    session = {
+        "name": name.strip(),
+        "channel_id": channel.id,
+        "channel_name": channel.name,
+        "started_at": started_at,
+        "participants": {},
+    }
+
+    for member in channel.members:
+        if not member.bot:
+            start_session(session, member)
+
+    active_attendance[guild_id] = session
+
+    await interaction.response.send_message(
+        f"📋 **Attendance started: {session['name']}**\n"
+        f"🎙️ Channel: {channel.mention}\n"
+        f"👥 Already present: "
+        f"{len([m for m in channel.members if not m.bot])}\n"
+        f"🔒 **No audio is being recorded.**\n\n"
+        "Use `/attendance status` to check progress and "
+        "`/attendance stop` to finish."
+    )
+
+
+@attendance_group.command(
+    name="status",
+    description="Show the current attendance-only session",
+)
+async def attendance_status(
+    interaction: discord.Interaction,
+):
+    if (
+        interaction.guild is None
+        or interaction.guild.id not in active_attendance
+    ):
+        await interaction.response.send_message(
+            "There is no active attendance-only session.",
+            ephemeral=True,
+        )
+        return
+
+    session = active_attendance[
+        interaction.guild.id
+    ]
+
+    rows = []
+
+    for uid, participant in session[
+        "participants"
+    ].items():
+        member = interaction.guild.get_member(uid)
+
+        in_channel = (
+            member is not None
+            and member.voice is not None
+            and member.voice.channel is not None
+            and member.voice.channel.id
+            == session["channel_id"]
+        )
+
+        rows.append(
+            (
+                participant["display_name"],
+                current_seconds(participant),
+                "🟢 Present" if in_channel else "⚪ Left",
+            )
+        )
+
+    rows.sort(
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    body = (
+        "\n".join(
+            f"• **{name}** — "
+            f"{format_duration(seconds)} — {state}"
+            for name, seconds, state in rows[:40]
+        )
+        if rows
+        else "No attendees recorded yet."
+    )
+
+    await interaction.response.send_message(
+        f"📋 **{session['name']}**\n"
+        f"🎙️ Channel: <#{session['channel_id']}>\n"
+        f"🔒 Recording: **NO**\n"
+        f"⏱️ Running: "
+        f"{format_duration((utcnow() - session['started_at']).total_seconds())}"
+        f"\n\n{body}"
+    )
+
+
+@attendance_group.command(
+    name="stop",
+    description="Stop attendance tracking and export the report",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def attendance_stop(
+    interaction: discord.Interaction,
+):
+    if (
+        interaction.guild is None
+        or interaction.guild.id not in active_attendance
+    ):
+        await interaction.response.send_message(
+            "There is no active attendance-only session.",
+            ephemeral=True,
+        )
+        return
+
+    guild_id = interaction.guild.id
+    session = active_attendance[guild_id]
+    ended_at = utcnow()
+
+    # Finalize currently-present attendees.
+    for participant in session["participants"].values():
+        if participant["joined_at"] is not None:
+            participant["seconds"] += (
+                ended_at - participant["joined_at"]
+            ).total_seconds()
+            participant["joined_at"] = None
+
+    rows, session_seconds = build_attendance_rows(
+        session,
+        ended_at,
+    )
+
+    attendance_path = write_attendance_csv(
+        session,
+        rows,
+        ended_at,
+    )
+
+    active_attendance.pop(guild_id, None)
+
+    if rows:
+        attendance_summary = "\n".join(
+            f"• **{row['display_name']}** — "
+            f"{row['minutes_attended']:.1f} min "
+            f"({row['attendance_percent']:.1f}%)"
+            for row in rows[:30]
+        )
+    else:
+        attendance_summary = "No attendees recorded."
+
+    await interaction.response.send_message(
+        f"🏁 **Attendance ended: {session['name']}**\n"
+        f"🎙️ Channel: <#{session['channel_id']}>\n"
+        f"⏱️ Session length: "
+        f"{format_duration(session_seconds)}\n"
+        f"🔒 No audio was recorded.\n\n"
+        f"{attendance_summary}",
+        file=discord.File(attendance_path),
+    )
 
 
 schedule_group = app_commands.Group(name="schedule", description="Schedule meetings and reminders")
@@ -816,6 +1136,16 @@ async def meeting_start(
 
     guild_id = interaction.guild.id
 
+    if guild_id in active_attendance:
+        current = active_attendance[guild_id]
+        await interaction.response.send_message(
+            f"📋 Attendance-only tracking is already active: "
+            f"**{current['name']}** in <#{current['channel_id']}>.\n"
+            "Stop it with `/attendance stop` before starting a recorded meeting.",
+            ephemeral=True,
+        )
+        return
+
     if guild_id in active_meetings:
         current = active_meetings[guild_id]
         await interaction.response.send_message(
@@ -1154,11 +1484,22 @@ async def on_voice_state_update(
     if member.bot:
         return
 
-    meeting = active_meetings.get(member.guild.id)
-    if not meeting:
-        return
+    sessions = []
 
-    tracked_channel_id = meeting["channel_id"]
+    recorded_meeting = active_meetings.get(
+        member.guild.id
+    )
+    if recorded_meeting:
+        sessions.append(recorded_meeting)
+
+    attendance_only = active_attendance.get(
+        member.guild.id
+    )
+    if attendance_only:
+        sessions.append(attendance_only)
+
+    if not sessions:
+        return
 
     before_id = (
         before.channel.id if before.channel else None
@@ -1167,21 +1508,24 @@ async def on_voice_state_update(
         after.channel.id if after.channel else None
     )
 
-    if (
-        before_id != tracked_channel_id
-        and after_id == tracked_channel_id
-    ):
-        start_session(meeting, member)
-        return
+    for session in sessions:
+        tracked_channel_id = session["channel_id"]
 
-    if (
-        before_id == tracked_channel_id
-        and after_id != tracked_channel_id
-    ):
-        end_session(meeting, member)
-        return
+        if (
+            before_id != tracked_channel_id
+            and after_id == tracked_channel_id
+        ):
+            start_session(session, member)
+            continue
+
+        if (
+            before_id == tracked_channel_id
+            and after_id != tracked_channel_id
+        ):
+            end_session(session, member)
 
 
+bot.tree.add_command(attendance_group)
 bot.tree.add_command(schedule_group)
 bot.tree.add_command(meeting_group)
 
