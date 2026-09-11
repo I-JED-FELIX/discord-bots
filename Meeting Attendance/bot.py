@@ -1177,17 +1177,62 @@ async def before_scheduled_reminder_worker():
     await bot.wait_until_ready()
 
 
-meeting_group = app_commands.Group(
-    name="meeting",
+
+async def send_recording_files(channel, meeting):
+    """Send captured per-speaker WAV files in manageable chunks."""
+    sink = meeting.get("audio_sink")
+    if sink is None:
+        return 0
+
+    paths = []
+    for uid, path in sink.paths.items():
+        if not path.exists() or path.stat().st_size <= 44:
+            continue
+
+        try:
+            parts = split_wav_if_needed(path)
+        except Exception as e:
+            print(
+                f"Could not prepare recording for {uid}: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+
+        paths.extend(parts)
+
+    if not paths:
+        await channel.send(
+            "🎙️ No usable audio files were captured for this recording."
+        )
+        return 0
+
+    sent = 0
+    for start in range(0, len(paths), 8):
+        batch_paths = paths[start:start + 8]
+        files = [
+            discord.File(p, filename=p.name)
+            for p in batch_paths
+        ]
+        await channel.send(
+            "🎙️ **Recording file(s)**",
+            files=files,
+        )
+        sent += len(files)
+
+    return sent
+
+
+record_group = app_commands.Group(
+    name="record",
     description=(
-        "Voice meeting attendance, recording, transcription and summaries"
+        "Voice recording with attendance; Pro adds transcription and AI summaries"
     ),
 )
 
 
-@meeting_group.command(
+@record_group.command(
     name="start",
-    description="Start attendance tracking and voice recording",
+    description="Start voice recording with attendance tracking",
 )
 @app_commands.describe(
     name="Meeting name",
@@ -1200,9 +1245,6 @@ async def meeting_start(
     name: str,
     channel: discord.VoiceChannel | None = None,
 ):
-    if not await require_pro(interaction):
-        return
-
     if interaction.guild is None:
         await interaction.response.send_message(
             "This command must be used inside a server.",
@@ -1227,7 +1269,7 @@ async def meeting_start(
         await interaction.response.send_message(
             f"A meeting is already active: **{current['name']}** "
             f"in <#{current['channel_id']}>.\n"
-            "End it first with `/meeting end`.",
+            "End it first with `/record stop`.",
             ephemeral=True,
         )
         return
@@ -1300,25 +1342,34 @@ async def meeting_start(
 
     active_meetings[guild_id] = meeting
 
+    plan = await get_guild_plan(guild_id)
+
+    ai_note = (
+        "💎 **Pro AI enabled:** This recording will also be transcribed "
+        "and summarized after `/record stop`."
+        if plan == "PRO"
+        else
+        "❄️ **Free recording:** Audio and attendance are being captured. "
+        "AI transcription and summaries require Frost Scribe Pro."
+    )
+
     await interaction.followup.send(
-        f"🔴 **Meeting recording started: {name}**\n"
+        f"🔴 **Recording started: {name}**\n"
         f"🎙️ Channel: {channel.mention}\n"
         f"👥 Already present: "
         f"{len([m for m in channel.members if not m.bot])}\n\n"
-        "⚠️ **Recording notice:** Audio in this voice channel is "
-        "being recorded, transcribed, and summarized. Everyone "
-        "present should be informed and consent before continuing."
+        f"{ai_note}\n\n"
+        "⚠️ **Recording notice:** Audio in this voice channel is being "
+        "recorded. Everyone present should be informed and consent "
+        "before continuing."
     )
 
 
-@meeting_group.command(
+@record_group.command(
     name="status",
-    description="Show attendance and recording status",
+    description="Show the active recording and attendance status",
 )
 async def meeting_status(interaction: discord.Interaction):
-    if not await require_pro(interaction):
-        return
-
     if (
         interaction.guild is None
         or interaction.guild.id not in active_meetings
@@ -1376,16 +1427,13 @@ async def meeting_status(interaction: discord.Interaction):
     )
 
 
-@meeting_group.command(
-    name="end",
+@record_group.command(
+    name="stop",
     description=(
-        "End meeting, export attendance, transcribe and summarize"
+        "Stop recording and export attendance"
     ),
 )
-async def meeting_end(interaction: discord.Interaction):
-    if not await require_pro(interaction):
-        return
-
+async def record_stop(interaction: discord.Interaction):
     if (
         interaction.guild is None
         or interaction.guild.id not in active_meetings
@@ -1506,16 +1554,42 @@ async def meeting_end(interaction: discord.Interaction):
     else:
         attendance_summary = "No attendees recorded."
 
+    plan = await get_guild_plan(guild_id)
+
+    if plan == "PRO":
+        next_step_text = (
+            "⏳ Audio recording stopped. I am now transcribing "
+            "the meeting and generating the AI summary."
+        )
+    else:
+        next_step_text = (
+            "🎙️ Audio recording stopped. Recording files will be attached below.\n"
+            "💎 Upgrade to **Frost Scribe Pro** for transcription and AI summaries."
+        )
+
     await interaction.followup.send(
-        f"🏁 **Meeting ended: {meeting['name']}**\n"
+        f"🏁 **Recording ended: {meeting['name']}**\n"
         f"🎙️ Channel: <#{meeting['channel_id']}>\n"
-        f"⏱️ Meeting length: "
+        f"⏱️ Recording length: "
         f"{format_duration(meeting_seconds)}\n\n"
         f"{attendance_summary}\n\n"
-        "⏳ Audio recording stopped. I am now transcribing "
-        "the meeting and generating the AI summary.",
+        f"{next_step_text}",
         file=discord.File(attendance_path),
     )
+
+    try:
+        await send_recording_files(
+            interaction.channel,
+            meeting,
+        )
+    except Exception as e:
+        await interaction.channel.send(
+            "⚠️ I could not upload one or more recording files.\n"
+            f"`{type(e).__name__}: {e}`"
+        )
+
+    if plan != "PRO":
+        return
 
     try:
         transcript, transcript_path = await asyncio.to_thread(
@@ -1610,7 +1684,7 @@ async def on_voice_state_update(
 bot.tree.add_command(plan_group)
 bot.tree.add_command(attendance_group)
 bot.tree.add_command(schedule_group)
-bot.tree.add_command(meeting_group)
+bot.tree.add_command(record_group)
 
 if not TOKEN:
     raise RuntimeError(
