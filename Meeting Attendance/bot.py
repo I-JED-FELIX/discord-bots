@@ -108,8 +108,47 @@ async def init_database():
             ON scheduled_meetings (cancelled, scheduled_at)
         """)
 
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS billing_cycle TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS entitlement_source TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS lifetime_code TEXT
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                entitlement_type TEXT NOT NULL,
+                max_redemptions INTEGER NOT NULL DEFAULT 1,
+                redemptions INTEGER NOT NULL DEFAULT 0,
+                redeemed_guild_id BIGINT,
+                redeemed_by BIGINT,
+                redeemed_at TIMESTAMPTZ,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            INSERT INTO promo_codes (code, entitlement_type, max_redemptions)
+            VALUES
+                ('CLOVER', 'LIFETIME_PRO', 1),
+                ('FROST', 'LIFETIME_PRO', 1)
+            ON CONFLICT (code) DO NOTHING
+        """)
+
     print("PostgreSQL connected.")
-    print("Database tables ready: guilds, scheduled_meetings")
+    print("Database tables ready: guilds, scheduled_meetings, promo_codes")
 
 
 async def ensure_guild(guild_id: int):
@@ -435,17 +474,35 @@ async def on_ready():
 
 
 async def get_guild_plan(guild_id: int) -> str:
-    """Return FREE or PRO for a Discord server."""
+    """Return the effective FREE/PRO plan for a Discord server."""
     if db_pool is None:
         return "FREE"
 
     await ensure_guild(guild_id)
 
-    plan = await db_pool.fetchval(
-        "SELECT plan FROM guilds WHERE guild_id = $1",
+    row = await db_pool.fetchrow(
+        """
+        SELECT plan, subscription_status,
+               subscription_expires_at, entitlement_source
+        FROM guilds
+        WHERE guild_id = $1
+        """,
         guild_id,
     )
-    return (plan or "FREE").upper()
+
+    if not row or (row["plan"] or "FREE").upper() != "PRO":
+        return "FREE"
+
+    if (row["entitlement_source"] or "").upper() == "LIFETIME_PROMO":
+        return "PRO"
+
+    status = (row["subscription_status"] or "").lower()
+    expires_at = row["subscription_expires_at"]
+
+    if status == "active" and (expires_at is None or expires_at > utcnow()):
+        return "PRO"
+
+    return "FREE"
 
 
 async def is_pro_guild(guild_id: int) -> bool:
@@ -492,19 +549,171 @@ async def plan_status(interaction: discord.Interaction):
         )
         return
 
+    await ensure_guild(interaction.guild.id)
+
+    row = await db_pool.fetchrow(
+        """
+        SELECT plan, subscription_status, billing_cycle,
+               subscription_expires_at, entitlement_source
+        FROM guilds
+        WHERE guild_id = $1
+        """,
+        interaction.guild.id,
+    )
+
     plan = await get_guild_plan(interaction.guild.id)
 
     if plan == "PRO":
+        if (row["entitlement_source"] or "").upper() == "LIFETIME_PROMO":
+            await interaction.response.send_message(
+                "👑 **Frost Scribe Lifetime Pro**\n"
+                "This server has permanent Pro access."
+            )
+            return
+
+        expires_at = row["subscription_expires_at"]
+        expiry_text = discord_time(expires_at, "F") if expires_at else "No expiry recorded"
+
         await interaction.response.send_message(
             "💎 **Frost Scribe Pro**\n"
-            "Recording, transcription, and AI meeting summaries are enabled."
+            f"Billing: **{row['billing_cycle'] or 'subscription'}**\n"
+            f"Status: **{row['subscription_status'] or 'active'}**\n"
+            f"Expires/Renews: {expiry_text}"
         )
-    else:
+        return
+
+    await interaction.response.send_message(
+        "❄️ **Frost Scribe Free**\n"
+        "Scheduling, reminders, attendance tracking, and recording are enabled.\n\n"
+        "💎 **Pro** adds AI transcription and AI meeting summaries."
+    )
+
+
+@bot.tree.command(
+    name="redeem",
+    description="Redeem a Frost Scribe promo code for this server",
+)
+@app_commands.describe(code="Promo code")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def redeem_code(interaction: discord.Interaction, code: str):
+    if interaction.guild is None:
         await interaction.response.send_message(
-            "❄️ **Frost Scribe Free**\n"
-            "Scheduling, reminders, and attendance tracking are enabled.\n\n"
-            "💎 **Pro** adds recording, transcription, and AI meeting summaries."
+            "This command must be used inside a server.",
+            ephemeral=True,
         )
+        return
+
+    normalized = code.strip().upper()
+    await interaction.response.defer(ephemeral=True)
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            promo = await conn.fetchrow(
+                "SELECT * FROM promo_codes WHERE code = $1 FOR UPDATE",
+                normalized,
+            )
+
+            if promo is None or not promo["active"]:
+                await interaction.followup.send(
+                    "❌ Invalid or inactive promo code.",
+                    ephemeral=True,
+                )
+                return
+
+            if promo["redemptions"] >= promo["max_redemptions"]:
+                if promo["redeemed_guild_id"] == interaction.guild.id:
+                    await interaction.followup.send(
+                        f"👑 This server already has Lifetime Pro from **{normalized}**.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        "❌ This promo code has already been redeemed.",
+                        ephemeral=True,
+                    )
+                return
+
+            current = await conn.fetchrow(
+                """
+                SELECT entitlement_source
+                FROM guilds
+                WHERE guild_id = $1
+                FOR UPDATE
+                """,
+                interaction.guild.id,
+            )
+
+            if current and (current["entitlement_source"] or "").upper() == "LIFETIME_PROMO":
+                await interaction.followup.send(
+                    "👑 This server already has Lifetime Pro.",
+                    ephemeral=True,
+                )
+                return
+
+            await conn.execute(
+                """
+                INSERT INTO guilds (
+                    guild_id, plan, subscription_status, billing_cycle,
+                    subscription_expires_at, entitlement_source,
+                    lifetime_code, updated_at
+                )
+                VALUES (
+                    $1, 'PRO', 'active', 'lifetime',
+                    NULL, 'LIFETIME_PROMO', $2, NOW()
+                )
+                ON CONFLICT (guild_id)
+                DO UPDATE SET
+                    plan = 'PRO',
+                    subscription_status = 'active',
+                    billing_cycle = 'lifetime',
+                    subscription_expires_at = NULL,
+                    entitlement_source = 'LIFETIME_PROMO',
+                    lifetime_code = EXCLUDED.lifetime_code,
+                    updated_at = NOW()
+                """,
+                interaction.guild.id,
+                normalized,
+            )
+
+            await conn.execute(
+                """
+                UPDATE promo_codes
+                SET redemptions = redemptions + 1,
+                    redeemed_guild_id = $2,
+                    redeemed_by = $3,
+                    redeemed_at = NOW()
+                WHERE code = $1
+                """,
+                normalized,
+                interaction.guild.id,
+                interaction.user.id,
+            )
+
+    await interaction.followup.send(
+        "👑 **Lifetime Pro activated!**\n"
+        "This server now has permanent Frost Scribe Pro access.\n"
+        "Use `/plan status` to confirm.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="upgrade",
+    description="See Frost Scribe Pro options",
+)
+async def upgrade(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "💎 **Frost Scribe Pro**\n\n"
+        "**Monthly** — flexible month-to-month subscription\n"
+        "**Annual** — discounted yearly subscription\n\n"
+        "**Pro includes:**\n"
+        "• AI transcription\n"
+        "• AI meeting summaries\n"
+        "• Key discussion points\n"
+        "• Decisions and action items\n\n"
+        "Payment checkout will be connected next.",
+        ephemeral=True,
+    )
 
 
 attendance_group = app_commands.Group(
