@@ -6,6 +6,7 @@ import wave
 import json
 import hmac
 import hashlib
+import shutil
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from pathlib import Path
@@ -46,6 +47,10 @@ PORT = int(os.getenv("PORT", "8080"))
 SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL")
 PUBLIC_BOT_INVITE_URL = os.getenv("PUBLIC_BOT_INVITE_URL")
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or GUILD_ID
+
+# Recording limits protect Railway disk/CPU from abandoned or excessively long sessions.
+FREE_RECORDING_LIMIT_MINUTES = int(os.getenv("FREE_RECORDING_LIMIT_MINUTES", "60"))
+PRO_RECORDING_LIMIT_MINUTES = int(os.getenv("PRO_RECORDING_LIMIT_MINUTES", "180"))
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -1496,7 +1501,8 @@ async def frost_help(interaction: discord.Interaction):
             "`/record start` — Record a meeting + attendance\n"
             "`/record status` — View active recording\n"
             "`/record stop` — Stop and export results\n"
-            "Free includes recording; Pro adds AI transcription and summaries."
+            f"Free: up to {FREE_RECORDING_LIMIT_MINUTES} min/recording. "
+            f"Pro: up to {PRO_RECORDING_LIMIT_MINUTES} min/recording + AI."
         ),
         inline=False,
     )
@@ -1653,8 +1659,10 @@ async def plan_status(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "❄️ **Frost Scribe Free**\n"
-        "Scheduling, reminders, attendance tracking, and recording are enabled.\n\n"
-        "💎 **Pro** adds AI transcription and AI meeting summaries."
+        "Scheduling, reminders, attendance tracking, and recording are enabled.\n"
+        f"Recording limit: **{FREE_RECORDING_LIMIT_MINUTES} minutes per meeting**.\n\n"
+        f"💎 **Pro** raises recording to **{PRO_RECORDING_LIMIT_MINUTES} minutes** "
+        "and adds AI transcription and AI meeting summaries."
     )
 
 
@@ -2473,38 +2481,44 @@ async def attendance_start(
 
 @attendance_group.command(
     name="status",
-    description="Show the current attendance-only session",
+    description="Show live attendance for the current session or recording",
 )
 async def attendance_status(
     interaction: discord.Interaction,
 ):
-    if (
-        interaction.guild is None
-        or interaction.guild.id not in active_attendance
-    ):
+    if interaction.guild is None:
         await interaction.response.send_message(
-            "There is no active attendance-only session.",
+            "This command must be used inside a server.",
             ephemeral=True,
         )
         return
 
-    session = active_attendance[
-        interaction.guild.id
-    ]
+    guild_id = interaction.guild.id
+    session = active_attendance.get(guild_id)
+    recording = False
+
+    # A recorded meeting already includes attendance tracking. If there is no
+    # attendance-only session, surface the recording's live attendance here too.
+    if session is None:
+        session = active_meetings.get(guild_id)
+        recording = session is not None
+
+    if session is None:
+        await interaction.response.send_message(
+            "There is no active attendance or recording session.",
+            ephemeral=True,
+        )
+        return
 
     rows = []
 
-    for uid, participant in session[
-        "participants"
-    ].items():
+    for uid, participant in session["participants"].items():
         member = interaction.guild.get_member(uid)
-
         in_channel = (
             member is not None
             and member.voice is not None
             and member.voice.channel is not None
-            and member.voice.channel.id
-            == session["channel_id"]
+            and member.voice.channel.id == session["channel_id"]
         )
 
         rows.append(
@@ -2515,25 +2529,22 @@ async def attendance_status(
             )
         )
 
-    rows.sort(
-        key=lambda item: item[1],
-        reverse=True,
-    )
+    rows.sort(key=lambda item: item[1], reverse=True)
 
     body = (
         "\n".join(
-            f"• **{name}** — "
-            f"{format_duration(seconds)} — {state}"
+            f"• **{name}** — {format_duration(seconds)} — {state}"
             for name, seconds, state in rows[:40]
         )
         if rows
         else "No attendees recorded yet."
     )
 
+    recording_text = "**YES**" if recording else "**NO**"
     await interaction.response.send_message(
         f"📋 **{session['name']}**\n"
         f"🎙️ Channel: <#{session['channel_id']}>\n"
-        f"🔒 Recording: **NO**\n"
+        f"🔴 Recording: {recording_text}\n"
         f"⏱️ Running: "
         f"{format_duration((utcnow() - session['started_at']).total_seconds())}"
         f"\n\n{body}"
@@ -3011,6 +3022,291 @@ async def send_recording_files(channel, meeting):
     return sent
 
 
+def cleanup_recording_directory(path: Path):
+    """Delete all temporary audio/transcript artifacts for one meeting."""
+    try:
+        if path and path.exists():
+            shutil.rmtree(path)
+            print(f"Cleaned recording directory: {path}")
+    except Exception as e:
+        print(
+            f"Recording cleanup failed for {path}: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+async def finalize_recording(
+    guild: discord.Guild,
+    fallback_channel,
+    guild_id: int,
+    *,
+    stop_reason: str = "manual",
+):
+    """Stop one recording, export attendance/audio, run Pro AI, then clean disk."""
+    meeting = active_meetings.pop(guild_id, None)
+    if meeting is None:
+        return None
+
+    limit_task = meeting.get("limit_task")
+    current_task = asyncio.current_task()
+    if (
+        limit_task
+        and limit_task is not current_task
+        and not limit_task.done()
+    ):
+        limit_task.cancel()
+
+    ended_at = utcnow()
+
+    for participant in meeting["participants"].values():
+        if participant["joined_at"] is not None:
+            participant["seconds"] += (
+                ended_at - participant["joined_at"]
+            ).total_seconds()
+            participant["joined_at"] = None
+
+    meeting_seconds = max(
+        1,
+        (ended_at - meeting["started_at"]).total_seconds(),
+    )
+
+    voice_client = meeting.get("voice_client")
+    sink = meeting["audio_sink"]
+
+    try:
+        if voice_client and voice_client.is_listening():
+            voice_client.stop_listening()
+    except Exception as e:
+        print(f"Could not stop voice listener cleanly: {e}")
+
+    sink.cleanup()
+
+    try:
+        if voice_client and voice_client.is_connected():
+            await voice_client.disconnect(force=True)
+    except Exception as e:
+        print(f"Could not disconnect voice client cleanly: {e}")
+
+    output_channel = await get_report_channel(guild, fallback_channel)
+    recording_dir = meeting["recording_dir"]
+
+    try:
+        date_str = ended_at.strftime("%Y-%m-%d_%H-%M-%S")
+        attendance_name = (
+            f"{safe_filename(meeting['name'])}_{date_str}.csv"
+        )
+        attendance_path = recording_dir / attendance_name
+
+        rows = []
+        for uid, participant in meeting["participants"].items():
+            seconds = participant["seconds"]
+            attendance_pct = min(
+                100.0,
+                (seconds / meeting_seconds) * 100,
+            )
+            rows.append(
+                {
+                    "discord_user_id": uid,
+                    "display_name": participant["display_name"],
+                    "username": participant["username"],
+                    "meeting_name": meeting["name"],
+                    "voice_channel": meeting["channel_name"],
+                    "meeting_started_utc": meeting["started_at"].isoformat(),
+                    "meeting_ended_utc": ended_at.isoformat(),
+                    "minutes_attended": round(seconds / 60, 2),
+                    "attendance_percent": round(attendance_pct, 2),
+                }
+            )
+
+        rows.sort(
+            key=lambda row: row["minutes_attended"],
+            reverse=True,
+        )
+
+        with attendance_path.open(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "discord_user_id",
+                    "display_name",
+                    "username",
+                    "meeting_name",
+                    "voice_channel",
+                    "meeting_started_utc",
+                    "meeting_ended_utc",
+                    "minutes_attended",
+                    "attendance_percent",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        if rows:
+            attendance_summary = "\n".join(
+                f"• **{row['display_name']}** — "
+                f"{row['minutes_attended']:.1f} min "
+                f"({row['attendance_percent']:.1f}%)"
+                for row in rows[:30]
+            )
+        else:
+            attendance_summary = "No attendees recorded."
+
+        plan = meeting.get("plan") or await get_guild_plan(guild_id)
+
+        if stop_reason == "limit":
+            reason_text = (
+                f"⏱️ Recording automatically stopped at the "
+                f"{meeting['limit_minutes']}-minute {plan.title()} limit.\n"
+            )
+        else:
+            reason_text = ""
+
+        if plan == "PRO":
+            next_step_text = (
+                "⏳ Audio recording stopped. I am now transcribing "
+                "the meeting and generating the AI summary."
+            )
+        else:
+            next_step_text = (
+                "🎙️ Audio recording stopped. Recording files are attached below.\n"
+                "💎 Upgrade to **Frost Scribe Pro** for transcription and AI summaries."
+            )
+
+        await output_channel.send(
+            f"🏁 **Recording ended: {meeting['name']}**\n"
+            f"🎙️ Channel: <#{meeting['channel_id']}>\n"
+            f"⏱️ Recording length: {format_duration(meeting_seconds)}\n"
+            f"{reason_text}\n"
+            f"{attendance_summary}\n\n"
+            f"{next_step_text}",
+            file=discord.File(attendance_path),
+        )
+
+        try:
+            await send_recording_files(output_channel, meeting)
+        except Exception as e:
+            await output_channel.send(
+                "⚠️ I could not upload one or more recording files.\n"
+                f"`{type(e).__name__}: {e}`"
+            )
+
+        if plan == "PRO":
+            try:
+                transcript, transcript_path = await asyncio.to_thread(
+                    transcribe_meeting,
+                    meeting,
+                    ended_at,
+                )
+
+                summary, summary_path = await asyncio.to_thread(
+                    summarize_transcript,
+                    meeting,
+                    ended_at,
+                    transcript,
+                )
+
+                preview = summary[:1700]
+                if len(summary) > 1700:
+                    preview += "\n\n…full summary attached."
+
+                attachments = [discord.File(transcript_path)]
+                if summary_path is not None and summary_path.exists():
+                    attachments.append(discord.File(summary_path))
+
+                await output_channel.send(
+                    f"📝 **AI Meeting Summary — {meeting['name']}**\n\n"
+                    f"{preview}",
+                    files=attachments,
+                )
+
+            except Exception as e:
+                await output_channel.send(
+                    "⚠️ Attendance and audio recording completed, but "
+                    "transcription or summarization failed.\n"
+                    f"`{type(e).__name__}: {e}`\n\n"
+                    "The temporary recording will still be deleted to "
+                    "protect server storage."
+                )
+
+        return {
+            "meeting": meeting,
+            "seconds": meeting_seconds,
+            "rows": rows,
+            "output_channel": output_channel,
+        }
+
+    finally:
+        # Recording files are temporary working files, not permanent storage.
+        cleanup_recording_directory(recording_dir)
+
+
+async def recording_limit_worker(guild_id: int):
+    """Warn before the plan limit, then automatically finalize the recording."""
+    meeting = active_meetings.get(guild_id)
+    if meeting is None:
+        return
+
+    limit_seconds = meeting["limit_minutes"] * 60
+    started_at = meeting["started_at"]
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+
+    fallback_channel = guild.get_channel(meeting["command_channel_id"])
+
+    async def still_current():
+        return active_meetings.get(guild_id) is meeting
+
+    async def sleep_until(offset_seconds: int):
+        target = started_at + timedelta(seconds=offset_seconds)
+        delay = max(0.0, (target - utcnow()).total_seconds())
+        await asyncio.sleep(delay)
+
+    try:
+        if limit_seconds > 600:
+            await sleep_until(limit_seconds - 600)
+            if not await still_current():
+                return
+            output = await get_report_channel(guild, fallback_channel)
+            await output.send(
+                f"⚠️ **Recording limit:** `{meeting['name']}` will "
+                "automatically stop in **10 minutes**."
+            )
+
+        if limit_seconds > 60:
+            await sleep_until(limit_seconds - 60)
+            if not await still_current():
+                return
+            output = await get_report_channel(guild, fallback_channel)
+            await output.send(
+                f"⚠️ **Recording limit:** `{meeting['name']}` will "
+                "automatically stop in **1 minute**."
+            )
+
+        await sleep_until(limit_seconds)
+        if not await still_current():
+            return
+
+        await finalize_recording(
+            guild,
+            fallback_channel,
+            guild_id,
+            stop_reason="limit",
+        )
+
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(
+            f"Recording limit worker failed for guild {guild_id}: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
 record_group = app_commands.Group(
     name="record",
     description=(
@@ -3118,6 +3414,13 @@ async def meeting_start(
         )
         return
 
+    plan = await get_guild_plan(guild_id)
+    limit_minutes = (
+        PRO_RECORDING_LIMIT_MINUTES
+        if plan == "PRO"
+        else FREE_RECORDING_LIMIT_MINUTES
+    )
+
     meeting = {
         "name": name,
         "channel_id": channel.id,
@@ -3127,6 +3430,10 @@ async def meeting_start(
         "voice_client": voice_client,
         "audio_sink": sink,
         "recording_dir": recording_dir,
+        "plan": plan,
+        "limit_minutes": limit_minutes,
+        "command_channel_id": interaction.channel.id,
+        "limit_task": None,
     }
 
     for member in channel.members:
@@ -3134,8 +3441,9 @@ async def meeting_start(
             start_session(meeting, member)
 
     active_meetings[guild_id] = meeting
-
-    plan = await get_guild_plan(guild_id)
+    meeting["limit_task"] = asyncio.create_task(
+        recording_limit_worker(guild_id)
+    )
 
     ai_note = (
         "💎 **Pro AI enabled:** This recording will also be transcribed "
@@ -3150,7 +3458,8 @@ async def meeting_start(
         f"🔴 **Recording started: {name}**\n"
         f"🎙️ Channel: {channel.mention}\n"
         f"👥 Already present: "
-        f"{len([m for m in channel.members if not m.bot])}\n\n"
+        f"{len([m for m in channel.members if not m.bot])}\n"
+        f"⏱️ Recording limit: **{limit_minutes} minutes**\n\n"
         f"{ai_note}\n\n"
         "⚠️ **Recording notice:** Audio in this voice channel is being "
         "recorded. Everyone present should be informed and consent "
@@ -3210,21 +3519,24 @@ async def meeting_status(interaction: discord.Interaction):
         and voice_client.is_listening()
     )
 
+    elapsed_seconds = (utcnow() - meeting["started_at"]).total_seconds()
+    limit_seconds = meeting.get("limit_minutes", 0) * 60
+    remaining_seconds = max(0, limit_seconds - elapsed_seconds) if limit_seconds else 0
+
     await interaction.response.send_message(
         f"📋 **{meeting['name']}**\n"
         f"🎙️ Channel: <#{meeting['channel_id']}>\n"
         f"🔴 Recording: {'YES' if recording else 'NO'}\n"
-        f"⏱️ Running: "
-        f"{format_duration((utcnow() - meeting['started_at']).total_seconds())}"
+        f"⏱️ Running: {format_duration(elapsed_seconds)}\n"
+        f"⌛ Limit: **{meeting.get('limit_minutes', '?')} min** "
+        f"({format_duration(remaining_seconds)} remaining)"
         f"\n\n{body}"
     )
 
 
 @record_group.command(
     name="stop",
-    description=(
-        "Stop recording and export attendance"
-    ),
+    description="Stop recording and export attendance",
 )
 async def record_stop(interaction: discord.Interaction):
     if (
@@ -3237,191 +3549,29 @@ async def record_stop(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
-    guild_id = interaction.guild.id
-    meeting = active_meetings[guild_id]
-
-    for participant in meeting["participants"].values():
-        if participant["joined_at"] is not None:
-            participant["seconds"] += (
-                utcnow() - participant["joined_at"]
-            ).total_seconds()
-            participant["joined_at"] = None
-
-    ended_at = utcnow()
-    meeting_seconds = max(
-        1,
-        (ended_at - meeting["started_at"]).total_seconds(),
+    result = await finalize_recording(
+        interaction.guild,
+        interaction.channel,
+        interaction.guild.id,
+        stop_reason="manual",
     )
 
-    voice_client = meeting.get("voice_client")
-    sink = meeting["audio_sink"]
-
-    try:
-        if voice_client and voice_client.is_listening():
-            voice_client.stop_listening()
-    except Exception as e:
-        print(f"Could not stop voice listener cleanly: {e}")
-
-    sink.cleanup()
-
-    try:
-        if voice_client and voice_client.is_connected():
-            await voice_client.disconnect(force=True)
-    except Exception as e:
-        print(f"Could not disconnect voice client cleanly: {e}")
-
-    date_str = ended_at.strftime("%Y-%m-%d_%H-%M-%S")
-    attendance_name = (
-        f"{safe_filename(meeting['name'])}_{date_str}.csv"
-    )
-    attendance_path = (
-        meeting["recording_dir"] / attendance_name
-    )
-
-    rows = []
-
-    for uid, participant in meeting["participants"].items():
-        seconds = participant["seconds"]
-        attendance_pct = min(
-            100.0,
-            (seconds / meeting_seconds) * 100,
+    if result is None:
+        await interaction.followup.send(
+            "The recording had already ended.",
+            ephemeral=True,
         )
-
-        rows.append(
-            {
-                "discord_user_id": uid,
-                "display_name": participant["display_name"],
-                "username": participant["username"],
-                "meeting_name": meeting["name"],
-                "voice_channel": meeting["channel_name"],
-                "meeting_started_utc": (
-                    meeting["started_at"].isoformat()
-                ),
-                "meeting_ended_utc": ended_at.isoformat(),
-                "minutes_attended": round(seconds / 60, 2),
-                "attendance_percent": round(
-                    attendance_pct, 2
-                ),
-            }
-        )
-
-    rows.sort(
-        key=lambda row: row["minutes_attended"],
-        reverse=True,
-    )
-
-    with attendance_path.open(
-        "w",
-        newline="",
-        encoding="utf-8-sig",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "discord_user_id",
-                "display_name",
-                "username",
-                "meeting_name",
-                "voice_channel",
-                "meeting_started_utc",
-                "meeting_ended_utc",
-                "minutes_attended",
-                "attendance_percent",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    # Remove from active meetings before long AI processing.
-    active_meetings.pop(guild_id, None)
-
-    if rows:
-        attendance_summary = "\n".join(
-            f"• **{row['display_name']}** — "
-            f"{row['minutes_attended']:.1f} min "
-            f"({row['attendance_percent']:.1f}%)"
-            for row in rows[:30]
-        )
-    else:
-        attendance_summary = "No attendees recorded."
-
-    plan = await get_guild_plan(guild_id)
-
-    if plan == "PRO":
-        next_step_text = (
-            "⏳ Audio recording stopped. I am now transcribing "
-            "the meeting and generating the AI summary."
-        )
-    else:
-        next_step_text = (
-            "🎙️ Audio recording stopped. Recording files will be attached below.\n"
-            "💎 Upgrade to **Frost Scribe Pro** for transcription and AI summaries."
-        )
-
-    await interaction.followup.send(
-        f"🏁 **Recording ended: {meeting['name']}**\n"
-        f"🎙️ Channel: <#{meeting['channel_id']}>\n"
-        f"⏱️ Recording length: "
-        f"{format_duration(meeting_seconds)}\n\n"
-        f"{attendance_summary}\n\n"
-        f"{next_step_text}",
-        file=discord.File(attendance_path),
-    )
-
-    try:
-        await send_recording_files(
-            interaction.channel,
-            meeting,
-        )
-    except Exception as e:
-        await (await get_report_channel(interaction.guild, interaction.channel)).send(
-            "⚠️ I could not upload one or more recording files.\n"
-            f"`{type(e).__name__}: {e}`"
-        )
-
-    if plan != "PRO":
         return
 
-    try:
-        transcript, transcript_path = await asyncio.to_thread(
-            transcribe_meeting,
-            meeting,
-            ended_at,
-        )
-
-        summary, summary_path = await asyncio.to_thread(
-            summarize_transcript,
-            meeting,
-            ended_at,
-            transcript,
-        )
-
-        preview = summary[:1700]
-        if len(summary) > 1700:
-            preview += "\n\n…full summary attached."
-
-        attachments = [discord.File(transcript_path)]
-
-        if summary_path is not None and summary_path.exists():
-            attachments.append(discord.File(summary_path))
-
-        await (await get_report_channel(interaction.guild, interaction.channel)).send(
-            f"📝 **AI Meeting Summary — {meeting['name']}**\n\n"
-            f"{preview}",
-            files=attachments,
-        )
-
-    except Exception as e:
-        await (await get_report_channel(interaction.guild, interaction.channel)).send(
-            "⚠️ The meeting attendance and WAV recording completed, "
-            "but transcription or summarization failed.\n"
-            f"`{type(e).__name__}: {e}`\n\n"
-            "Check the Railway deploy logs. The recording files are "
-            "stored in the service's temporary `data/recordings` "
-            "directory for this deployment."
-        )
+    output_channel = result["output_channel"]
+    await interaction.followup.send(
+        f"✅ Recording stopped. Results were posted in {output_channel.mention}.\n"
+        "Temporary recording files have been deleted from Frost Scribe's "
+        "Railway storage after processing.",
+        ephemeral=True,
+    )
 
 
 @bot.event
