@@ -43,6 +43,9 @@ RAZORPAY_MONTHLY_PLAN_ID = os.getenv("RAZORPAY_MONTHLY_PLAN_ID")
 RAZORPAY_ANNUAL_PLAN_ID = os.getenv("RAZORPAY_ANNUAL_PLAN_ID")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", "8080"))
+SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL")
+PUBLIC_BOT_INVITE_URL = os.getenv("PUBLIC_BOT_INVITE_URL")
+DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or GUILD_ID
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -173,6 +176,27 @@ async def init_database():
         """)
 
         await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS setup_complete BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS default_voice_channel_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS default_report_channel_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS timezone_name TEXT NOT NULL DEFAULT 'UTC'
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS attendance_enabled BOOLEAN NOT NULL DEFAULT TRUE
+        """)
+
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_subscriptions (
                 subscription_id TEXT PRIMARY KEY,
                 guild_id BIGINT NOT NULL,
@@ -233,6 +257,20 @@ async def ensure_guild(guild_id: int):
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+async def get_report_channel(guild: discord.Guild, fallback_channel):
+    """Return configured output channel, or the command channel as fallback."""
+    try:
+        config = await get_guild_config(guild.id)
+        channel_id = config["default_report_channel_id"] if config else None
+        if channel_id:
+            channel = guild.get_channel(channel_id)
+            if channel is not None:
+                return channel
+    except Exception:
+        pass
+    return fallback_channel
 
 
 def format_duration(seconds: float) -> str:
@@ -526,20 +564,34 @@ async def on_ready():
         return
 
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} global commands")
+
+        if DEV_GUILD_ID:
+            dev_guild = discord.Object(id=int(DEV_GUILD_ID))
+            bot.tree.copy_global_to(guild=dev_guild)
+            dev_synced = await bot.tree.sync(guild=dev_guild)
             print(
-                f"Synced {len(synced)} commands to guild {GUILD_ID}"
+                f"Synced {len(dev_synced)} commands to dev guild "
+                f"{DEV_GUILD_ID}"
             )
-        else:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} global commands")
     except Exception as e:
         print(f"Command sync failed: {e}")
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Initialize Frost Scribe data immediately when added to a new server."""
+    try:
+        await ensure_guild(guild.id)
+        print(f"Initialized Frost Scribe for guild {guild.id} ({guild.name})")
+    except Exception as e:
+        print(
+            f"Guild initialization failed for {guild.id}: "
+            f"{type(e).__name__}: {e}"
+        )
 
 
 
@@ -1041,6 +1093,511 @@ async def require_pro(interaction: discord.Interaction) -> bool:
         ephemeral=True,
     )
     return False
+
+
+async def get_guild_config(guild_id: int):
+    await ensure_guild(guild_id)
+    return await db_pool.fetchrow(
+        """
+        SELECT setup_complete,
+               default_voice_channel_id,
+               default_report_channel_id,
+               timezone_name,
+               attendance_enabled,
+               plan,
+               subscription_status
+        FROM guilds
+        WHERE guild_id = $1
+        """,
+        guild_id,
+    )
+
+
+def setup_embed(guild: discord.Guild, config):
+    voice_id = config["default_voice_channel_id"] if config else None
+    report_id = config["default_report_channel_id"] if config else None
+    timezone_name = config["timezone_name"] if config else "UTC"
+    attendance_enabled = (
+        config["attendance_enabled"] if config else True
+    )
+    setup_complete = config["setup_complete"] if config else False
+    plan = (config["plan"] if config else "FREE") or "FREE"
+
+    embed = discord.Embed(
+        title="❄️ Frost Scribe — Server Setup",
+        description=(
+            f"Configure Frost Scribe for **{guild.name}**.\n"
+            "Changes are saved immediately. Press **Finish Setup** when ready."
+        ),
+    )
+    embed.add_field(
+        name="Plan",
+        value=f"**{plan.title()}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Setup Status",
+        value="✅ Complete" if setup_complete else "🛠️ In progress",
+        inline=True,
+    )
+    embed.add_field(
+        name="Default Voice Channel",
+        value=f"<#{voice_id}>" if voice_id else "Not set",
+        inline=False,
+    )
+    embed.add_field(
+        name="Reports / Output Channel",
+        value=f"<#{report_id}>" if report_id else "Not set",
+        inline=False,
+    )
+    embed.add_field(
+        name="Timezone",
+        value=f"`{timezone_name or 'UTC'}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="Attendance",
+        value="Enabled" if attendance_enabled else "Disabled",
+        inline=True,
+    )
+    embed.set_footer(
+        text="You can run /setup again at any time to change these settings."
+    )
+    return embed
+
+
+class SetupVoiceChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, owner_id: int, guild_id: int):
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        super().__init__(
+            placeholder="Select default voice channel",
+            channel_types=[
+                discord.ChannelType.voice,
+                discord.ChannelType.stage_voice,
+            ],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This setup panel belongs to another administrator.",
+                ephemeral=True,
+            )
+            return
+
+        channel = self.values[0]
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET default_voice_channel_id = $2,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+            channel.id,
+        )
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_embed(interaction.guild, config),
+            view=SetupView(self.owner_id, self.guild_id),
+        )
+
+
+class SetupReportChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, owner_id: int, guild_id: int):
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        super().__init__(
+            placeholder="Select reports/output channel",
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+            ],
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This setup panel belongs to another administrator.",
+                ephemeral=True,
+            )
+            return
+
+        channel = self.values[0]
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET default_report_channel_id = $2,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+            channel.id,
+        )
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_embed(interaction.guild, config),
+            view=SetupView(self.owner_id, self.guild_id),
+        )
+
+
+class SetupTimezoneModal(
+    discord.ui.Modal,
+    title="Frost Scribe Timezone",
+):
+    timezone_name = discord.ui.TextInput(
+        label="IANA timezone",
+        placeholder="Example: Asia/Kolkata, Asia/Manila, Europe/London",
+        max_length=64,
+    )
+
+    def __init__(self, owner_id: int, guild_id: int, current: str):
+        super().__init__()
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.timezone_name.default = current or "UTC"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = str(self.timezone_name).strip()
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError:
+            await interaction.response.send_message(
+                "❌ Unknown timezone. Use an IANA timezone such as "
+                "`Asia/Kolkata`, `Asia/Manila`, `Europe/London`, or "
+                "`America/New_York`.",
+                ephemeral=True,
+            )
+            return
+
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET timezone_name = $2,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+            value,
+        )
+
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_embed(interaction.guild, config),
+            view=SetupView(self.owner_id, self.guild_id),
+        )
+
+
+class SetupView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=900)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.add_item(SetupVoiceChannelSelect(owner_id, guild_id))
+        self.add_item(SetupReportChannelSelect(owner_id, guild_id))
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This setup panel belongs to another administrator.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Timezone",
+        emoji="🌍",
+        style=discord.ButtonStyle.secondary,
+        row=2,
+    )
+    async def timezone_button(self, interaction, button):
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.send_modal(
+            SetupTimezoneModal(
+                self.owner_id,
+                self.guild_id,
+                config["timezone_name"] or "UTC",
+            )
+        )
+
+    @discord.ui.button(
+        label="Toggle Attendance",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        row=2,
+    )
+    async def attendance_button(self, interaction, button):
+        config = await get_guild_config(self.guild_id)
+        new_value = not bool(config["attendance_enabled"])
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET attendance_enabled = $2,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+            new_value,
+        )
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_embed(interaction.guild, config),
+            view=SetupView(self.owner_id, self.guild_id),
+        )
+
+    @discord.ui.button(
+        label="Finish Setup",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        row=3,
+    )
+    async def finish_button(self, interaction, button):
+        config = await get_guild_config(self.guild_id)
+        missing = []
+        if not config["default_voice_channel_id"]:
+            missing.append("default voice channel")
+        if not config["default_report_channel_id"]:
+            missing.append("reports/output channel")
+
+        if missing:
+            await interaction.response.send_message(
+                "❌ Before finishing, set: " + ", ".join(missing) + ".",
+                ephemeral=True,
+            )
+            return
+
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET setup_complete = TRUE,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+        )
+        config = await get_guild_config(self.guild_id)
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ Frost Scribe is ready",
+                description=(
+                    f"**{interaction.guild.name}** has been configured.\n\n"
+                    f"🎙️ Default voice: <#{config['default_voice_channel_id']}>\n"
+                    f"📝 Reports: <#{config['default_report_channel_id']}>\n"
+                    f"🌍 Timezone: `{config['timezone_name']}`\n"
+                    f"📋 Attendance: "
+                    f"**{'Enabled' if config['attendance_enabled'] else 'Disabled'}**\n\n"
+                    "Use `/help` to see Frost Scribe commands."
+                ),
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Reset Setup",
+        emoji="♻️",
+        style=discord.ButtonStyle.danger,
+        row=3,
+    )
+    async def reset_button(self, interaction, button):
+        await db_pool.execute(
+            """
+            UPDATE guilds
+            SET setup_complete = FALSE,
+                default_voice_channel_id = NULL,
+                default_report_channel_id = NULL,
+                timezone_name = 'UTC',
+                attendance_enabled = TRUE,
+                updated_at = NOW()
+            WHERE guild_id = $1
+            """,
+            self.guild_id,
+        )
+        config = await get_guild_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_embed(interaction.guild, config),
+            view=SetupView(self.owner_id, self.guild_id),
+        )
+
+
+@bot.tree.command(
+    name="setup",
+    description="Configure Frost Scribe for this server",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setup_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    config = await get_guild_config(interaction.guild.id)
+    await interaction.response.send_message(
+        embed=setup_embed(interaction.guild, config),
+        view=SetupView(
+            interaction.user.id,
+            interaction.guild.id,
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="help",
+    description="Show Frost Scribe commands and features",
+)
+async def frost_help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="❄️ Frost Scribe — Help",
+        description=(
+            "Meeting scheduling, attendance, recording, and AI-powered "
+            "meeting notes for Discord."
+        ),
+    )
+    embed.add_field(
+        name="🛠️ Setup",
+        value=(
+            "`/setup` — Configure this server *(Manage Server)*\n"
+            "`/plan status` — Check Free/Pro status"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📅 Scheduling",
+        value=(
+            "`/schedule create` — Interactive meeting scheduler\n"
+            "`/schedule list` — Upcoming meetings\n"
+            "`/schedule cancel` — Cancel a scheduled meeting"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📋 Attendance",
+        value=(
+            "`/attendance start` — Start attendance-only tracking\n"
+            "`/attendance status` — View attendance session\n"
+            "`/attendance stop` — Export attendance report"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎙️ Recording",
+        value=(
+            "`/record start` — Record a meeting + attendance\n"
+            "`/record status` — View active recording\n"
+            "`/record stop` — Stop and export results\n"
+            "Free includes recording; Pro adds AI transcription and summaries."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💎 Pro & Billing",
+        value=(
+            "`/plan upgrade` — Monthly ₹199 / Annual ₹1,999\n"
+            "`/plan billing` — Billing details\n"
+            "`/plan cancel` — Cancel at billing-cycle end\n"
+            "`/redeem` — Redeem a promo code"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="❤️ Support",
+        value=(
+            "`/donate` — Optional one-time donation\n"
+            "`/invite` — Add Frost Scribe to another server\n"
+            "`/support` — Support/community link"
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+def frost_invite_url():
+    if PUBLIC_BOT_INVITE_URL:
+        return PUBLIC_BOT_INVITE_URL
+
+    if bot.user is None:
+        return None
+
+    permissions = discord.Permissions(2184301568)
+    return discord.utils.oauth_url(
+        bot.user.id,
+        permissions=permissions,
+        scopes=("bot", "applications.commands"),
+    )
+
+
+@bot.tree.command(
+    name="invite",
+    description="Get the Frost Scribe server install link",
+)
+async def invite_command(interaction: discord.Interaction):
+    url = frost_invite_url()
+    if not url:
+        await interaction.response.send_message(
+            "The invite link is not available yet.",
+            ephemeral=True,
+        )
+        return
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Add Frost Scribe",
+            emoji="❄️",
+            style=discord.ButtonStyle.link,
+            url=url,
+        )
+    )
+    await interaction.response.send_message(
+        "❄️ **Install Frost Scribe on another Discord server:**",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="support",
+    description="Get Frost Scribe support information",
+)
+async def support_command(interaction: discord.Interaction):
+    if SUPPORT_SERVER_URL:
+        view = discord.ui.View(timeout=None)
+        view.add_item(
+            discord.ui.Button(
+                label="Frost Scribe Support",
+                emoji="🛟",
+                style=discord.ButtonStyle.link,
+                url=SUPPORT_SERVER_URL,
+            )
+        )
+        await interaction.response.send_message(
+            "Need help with Frost Scribe?",
+            view=view,
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "🛟 **Frost Scribe Support**\n"
+        "A public support-server link has not been configured yet.\n"
+        "Server administrators can still use `/help` for command guidance.",
+        ephemeral=True,
+    )
 
 
 plan_group = app_commands.Group(
@@ -1863,28 +2420,29 @@ async def attendance_start(
         )
 
         if (
-            member is None
-            or member.voice is None
-            or member.voice.channel is None
+            member is not None
+            and member.voice is not None
+            and isinstance(member.voice.channel, discord.VoiceChannel)
         ):
-            await interaction.response.send_message(
-                "Join the voice channel first, or specify the "
-                "`channel` option.",
-                ephemeral=True,
+            channel = member.voice.channel
+        else:
+            config = await get_guild_config(guild_id)
+            default_voice_id = (
+                config["default_voice_channel_id"] if config else None
             )
-            return
-
-        if not isinstance(
-            member.voice.channel,
-            discord.VoiceChannel,
-        ):
-            await interaction.response.send_message(
-                "Please use a standard Discord voice channel.",
-                ephemeral=True,
+            default_voice = (
+                interaction.guild.get_channel(default_voice_id)
+                if default_voice_id else None
             )
-            return
-
-        channel = member.voice.channel
+            if isinstance(default_voice, discord.VoiceChannel):
+                channel = default_voice
+            else:
+                await interaction.response.send_message(
+                    "Join a voice channel, specify the `channel` option, "
+                    "or configure a default voice channel with `/setup`.",
+                    ephemeral=True,
+                )
+                return
 
     started_at = utcnow()
 
@@ -2301,6 +2859,11 @@ async def schedule_create(interaction: discord.Interaction):
         return
 
     draft = ScheduleDraft(interaction.user.id, interaction.guild.id)
+    config = await get_guild_config(interaction.guild.id)
+    if config:
+        draft.timezone_name = config["timezone_name"] or "UTC"
+        draft.reminder_channel_id = config["default_report_channel_id"]
+
     schedule_drafts[(interaction.guild.id, interaction.user.id)] = draft
 
     await interaction.response.send_message(
@@ -2504,25 +3067,29 @@ async def meeting_start(
         member = interaction.guild.get_member(interaction.user.id)
 
         if (
-            member is None
-            or member.voice is None
-            or member.voice.channel is None
+            member is not None
+            and member.voice is not None
+            and isinstance(member.voice.channel, discord.VoiceChannel)
         ):
-            await interaction.response.send_message(
-                "Join the voice channel first, or specify the "
-                "`channel` option.",
-                ephemeral=True,
+            channel = member.voice.channel
+        else:
+            config = await get_guild_config(guild_id)
+            default_voice_id = (
+                config["default_voice_channel_id"] if config else None
             )
-            return
-
-        if not isinstance(member.voice.channel, discord.VoiceChannel):
-            await interaction.response.send_message(
-                "Please use a standard Discord voice channel.",
-                ephemeral=True,
+            default_voice = (
+                interaction.guild.get_channel(default_voice_id)
+                if default_voice_id else None
             )
-            return
-
-        channel = member.voice.channel
+            if isinstance(default_voice, discord.VoiceChannel):
+                channel = default_voice
+            else:
+                await interaction.response.send_message(
+                    "Join a voice channel, specify the `channel` option, "
+                    "or configure a default voice channel with `/setup`.",
+                    ephemeral=True,
+                )
+                return
 
     await interaction.response.defer()
 
@@ -2809,7 +3376,7 @@ async def record_stop(interaction: discord.Interaction):
             meeting,
         )
     except Exception as e:
-        await interaction.channel.send(
+        await (await get_report_channel(interaction.guild, interaction.channel)).send(
             "⚠️ I could not upload one or more recording files.\n"
             f"`{type(e).__name__}: {e}`"
         )
@@ -2840,14 +3407,14 @@ async def record_stop(interaction: discord.Interaction):
         if summary_path is not None and summary_path.exists():
             attachments.append(discord.File(summary_path))
 
-        await interaction.channel.send(
+        await (await get_report_channel(interaction.guild, interaction.channel)).send(
             f"📝 **AI Meeting Summary — {meeting['name']}**\n\n"
             f"{preview}",
             files=attachments,
         )
 
     except Exception as e:
-        await interaction.channel.send(
+        await (await get_report_channel(interaction.guild, interaction.channel)).send(
             "⚠️ The meeting attendance and WAV recording completed, "
             "but transcription or summarization failed.\n"
             f"`{type(e).__name__}: {e}`\n\n"
