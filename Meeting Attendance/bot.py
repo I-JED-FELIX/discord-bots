@@ -3,11 +3,16 @@ import csv
 import asyncio
 import threading
 import wave
+import json
+import hmac
+import hashlib
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from pathlib import Path
 
 import asyncpg
+import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
@@ -31,6 +36,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+RAZORPAY_MONTHLY_PLAN_ID = os.getenv("RAZORPAY_MONTHLY_PLAN_ID")
+RAZORPAY_ANNUAL_PLAN_ID = os.getenv("RAZORPAY_ANNUAL_PLAN_ID")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+PORT = int(os.getenv("PORT", "8080"))
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -56,6 +68,9 @@ active_attendance = {}
 
 # PostgreSQL connection pool. Railway supplies DATABASE_URL.
 db_pool = None
+
+# Embedded HTTP server used for Razorpay webhooks/health checks.
+web_runner = None
 
 
 async def init_database():
@@ -147,8 +162,61 @@ async def init_database():
             ON CONFLICT (code) DO NOTHING
         """)
 
+
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS razorpay_subscription_id TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE guilds
+            ADD COLUMN IF NOT EXISTS cancel_at_cycle_end BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS guild_subscriptions (
+                subscription_id TEXT PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                created_by BIGINT NOT NULL,
+                billing_cycle TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created',
+                short_url TEXT,
+                current_period_end TIMESTAMPTZ,
+                cancel_at_cycle_end BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_guild_subscriptions_guild
+            ON guild_subscriptions (guild_id, created_at DESC)
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS donations (
+                id BIGSERIAL PRIMARY KEY,
+                payment_link_id TEXT UNIQUE,
+                payment_id TEXT,
+                guild_id BIGINT,
+                user_id BIGINT,
+                amount_paise BIGINT NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'INR',
+                status TEXT NOT NULL DEFAULT 'paid',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS razorpay_webhook_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
     print("PostgreSQL connected.")
-    print("Database tables ready: guilds, scheduled_meetings, promo_codes")
+    print("Database tables ready: guilds, scheduled_meetings, promo_codes, guild_subscriptions, donations")
 
 
 async def ensure_guild(guild_id: int):
@@ -451,6 +519,8 @@ async def on_ready():
         if not scheduled_reminder_worker.is_running():
             scheduled_reminder_worker.start()
 
+        await start_web_server()
+
     except Exception as e:
         print(f"Database initialization failed: {type(e).__name__}: {e}")
         return
@@ -471,6 +541,448 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
+
+
+def razorpay_configured() -> bool:
+    return bool(
+        RAZORPAY_KEY_ID
+        and RAZORPAY_KEY_SECRET
+        and RAZORPAY_MONTHLY_PLAN_ID
+        and RAZORPAY_ANNUAL_PLAN_ID
+    )
+
+
+async def razorpay_request(method: str, path: str, payload=None):
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise RuntimeError("Razorpay API credentials are not configured.")
+
+    url = f"https://api.razorpay.com/v1{path}"
+    auth = aiohttp.BasicAuth(
+        RAZORPAY_KEY_ID,
+        RAZORPAY_KEY_SECRET,
+    )
+
+    async with aiohttp.ClientSession(auth=auth) as session:
+        async with session.request(
+            method,
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            data = await response.json(content_type=None)
+
+            if response.status >= 400:
+                description = (
+                    data.get("error", {}).get("description")
+                    if isinstance(data, dict)
+                    else None
+                )
+                raise RuntimeError(
+                    description or f"Razorpay API error {response.status}"
+                )
+
+            return data
+
+
+async def create_razorpay_subscription(
+    guild_id: int,
+    user_id: int,
+    billing_cycle: str,
+):
+    cycle = billing_cycle.lower()
+
+    if cycle == "monthly":
+        plan_id = RAZORPAY_MONTHLY_PLAN_ID
+        total_count = 120
+    elif cycle == "annual":
+        plan_id = RAZORPAY_ANNUAL_PLAN_ID
+        total_count = 10
+    else:
+        raise ValueError("Unsupported billing cycle.")
+
+    if not plan_id:
+        raise RuntimeError(
+            f"Razorpay {cycle} Plan ID is missing."
+        )
+
+    payload = {
+        "plan_id": plan_id,
+        "total_count": total_count,
+        "customer_notify": 1,
+        "notes": {
+            "product": "Frost Scribe Pro",
+            "guild_id": str(guild_id),
+            "created_by": str(user_id),
+            "billing_cycle": cycle,
+        },
+    }
+
+    result = await razorpay_request(
+        "POST",
+        "/subscriptions",
+        payload,
+    )
+
+    await db_pool.execute(
+        """
+        INSERT INTO guild_subscriptions (
+            subscription_id,
+            guild_id,
+            created_by,
+            billing_cycle,
+            plan_id,
+            status,
+            short_url,
+            updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+        ON CONFLICT (subscription_id)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            short_url = EXCLUDED.short_url,
+            updated_at = NOW()
+        """,
+        result["id"],
+        guild_id,
+        user_id,
+        cycle,
+        plan_id,
+        result.get("status", "created"),
+        result.get("short_url"),
+    )
+
+    return result
+
+
+async def create_donation_link(
+    guild_id: int | None,
+    user_id: int,
+    amount_inr: int,
+):
+    if amount_inr < 10 or amount_inr > 100000:
+        raise ValueError(
+            "Donation must be between ₹10 and ₹1,00,000."
+        )
+
+    amount_paise = amount_inr * 100
+
+    payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": "Support Frost Scribe development",
+        "reminder_enable": False,
+        "notes": {
+            "kind": "donation",
+            "product": "Frost Scribe",
+            "guild_id": str(guild_id or 0),
+            "user_id": str(user_id),
+            "amount_inr": str(amount_inr),
+        },
+    }
+
+    return await razorpay_request(
+        "POST",
+        "/payment_links",
+        payload,
+    )
+
+
+async def activate_paid_subscription(
+    subscription_id: str,
+    status: str,
+    current_period_end=None,
+):
+    row = await db_pool.fetchrow(
+        """
+        SELECT guild_id, billing_cycle
+        FROM guild_subscriptions
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+    )
+
+    if not row:
+        return
+
+    guild_id = row["guild_id"]
+
+    await db_pool.execute(
+        """
+        UPDATE guild_subscriptions
+        SET status = $2,
+            current_period_end = COALESCE($3, current_period_end),
+            updated_at = NOW()
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+        status,
+        current_period_end,
+    )
+
+    await db_pool.execute(
+        """
+        UPDATE guilds
+        SET plan = 'PRO',
+            subscription_status = 'active',
+            billing_cycle = $2,
+            subscription_expires_at = COALESCE($3, subscription_expires_at),
+            entitlement_source = 'RAZORPAY',
+            lifetime_code = NULL,
+            razorpay_subscription_id = $4,
+            cancel_at_cycle_end = FALSE,
+            updated_at = NOW()
+        WHERE guild_id = $1
+          AND COALESCE(entitlement_source, '') <> 'LIFETIME_PROMO'
+        """,
+        guild_id,
+        row["billing_cycle"],
+        current_period_end,
+        subscription_id,
+    )
+
+
+async def mark_subscription_inactive(
+    subscription_id: str,
+    status: str,
+):
+    row = await db_pool.fetchrow(
+        """
+        SELECT guild_id
+        FROM guild_subscriptions
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+    )
+
+    if not row:
+        return
+
+    await db_pool.execute(
+        """
+        UPDATE guild_subscriptions
+        SET status = $2,
+            updated_at = NOW()
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+        status,
+    )
+
+    await db_pool.execute(
+        """
+        UPDATE guilds
+        SET plan = 'FREE',
+            subscription_status = $2,
+            subscription_expires_at = NULL,
+            entitlement_source = NULL,
+            razorpay_subscription_id = NULL,
+            cancel_at_cycle_end = FALSE,
+            updated_at = NOW()
+        WHERE guild_id = $1
+          AND COALESCE(entitlement_source, '') <> 'LIFETIME_PROMO'
+        """,
+        row["guild_id"],
+        status,
+    )
+
+
+def _unix_to_datetime(value):
+    if not value:
+        return None
+    return datetime.fromtimestamp(
+        int(value),
+        tz=timezone.utc,
+    )
+
+
+async def razorpay_webhook(request: web.Request):
+    if not RAZORPAY_WEBHOOK_SECRET:
+        return web.Response(
+            status=503,
+            text="Webhook secret not configured",
+        )
+
+    raw_body = await request.read()
+    signature = request.headers.get(
+        "X-Razorpay-Signature",
+        "",
+    )
+
+    expected = hmac.new(
+        RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected):
+        return web.Response(
+            status=401,
+            text="Invalid signature",
+        )
+
+    payload = json.loads(raw_body.decode("utf-8"))
+    event_type = payload.get("event", "unknown")
+    event_id = (
+        request.headers.get("X-Razorpay-Event-Id")
+        or hashlib.sha256(raw_body).hexdigest()
+    )
+
+    inserted = await db_pool.fetchval(
+        """
+        INSERT INTO razorpay_webhook_events (
+            event_id,
+            event_type
+        )
+        VALUES ($1,$2)
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
+        """,
+        event_id,
+        event_type,
+    )
+
+    if not inserted:
+        return web.Response(
+            status=200,
+            text="Duplicate ignored",
+        )
+
+    try:
+        if event_type.startswith("subscription."):
+            entity = (
+                payload.get("payload", {})
+                .get("subscription", {})
+                .get("entity", {})
+            )
+
+            subscription_id = entity.get("id")
+            status = entity.get("status") or event_type.split(".", 1)[1]
+            period_end = _unix_to_datetime(
+                entity.get("current_end")
+                or entity.get("end_at")
+            )
+
+            if subscription_id:
+                if event_type in {
+                    "subscription.activated",
+                    "subscription.charged",
+                    "subscription.resumed",
+                }:
+                    await activate_paid_subscription(
+                        subscription_id,
+                        "active",
+                        period_end,
+                    )
+                elif event_type in {
+                    "subscription.cancelled",
+                    "subscription.completed",
+                    "subscription.expired",
+                }:
+                    await mark_subscription_inactive(
+                        subscription_id,
+                        status,
+                    )
+                else:
+                    await db_pool.execute(
+                        """
+                        UPDATE guild_subscriptions
+                        SET status = $2,
+                            current_period_end = COALESCE($3, current_period_end),
+                            updated_at = NOW()
+                        WHERE subscription_id = $1
+                        """,
+                        subscription_id,
+                        status,
+                        period_end,
+                    )
+
+        elif event_type == "payment_link.paid":
+            payment_link = (
+                payload.get("payload", {})
+                .get("payment_link", {})
+                .get("entity", {})
+            )
+            payment = (
+                payload.get("payload", {})
+                .get("payment", {})
+                .get("entity", {})
+            )
+
+            notes = payment_link.get("notes") or {}
+            if notes.get("kind") == "donation":
+                await db_pool.execute(
+                    """
+                    INSERT INTO donations (
+                        payment_link_id,
+                        payment_id,
+                        guild_id,
+                        user_id,
+                        amount_paise,
+                        currency,
+                        status
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,'paid')
+                    ON CONFLICT (payment_link_id) DO NOTHING
+                    """,
+                    payment_link.get("id"),
+                    payment.get("id"),
+                    int(notes.get("guild_id", "0")) or None,
+                    int(notes.get("user_id", "0")) or None,
+                    int(payment_link.get("amount") or payment.get("amount") or 0),
+                    payment_link.get("currency") or payment.get("currency") or "INR",
+                )
+
+    except Exception as e:
+        print(
+            f"Razorpay webhook processing failed: "
+            f"{type(e).__name__}: {e}"
+        )
+        return web.Response(
+            status=500,
+            text="Processing failed",
+        )
+
+    return web.Response(
+        status=200,
+        text="OK",
+    )
+
+
+async def health_check(request: web.Request):
+    return web.json_response(
+        {
+            "ok": True,
+            "bot": str(bot.user) if bot.user else None,
+            "database": db_pool is not None,
+        }
+    )
+
+
+async def start_web_server():
+    global web_runner
+
+    if web_runner is not None:
+        return
+
+    app = web.Application()
+    app.router.add_get("/health", health_check)
+    app.router.add_post(
+        "/razorpay/webhook",
+        razorpay_webhook,
+    )
+
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
+
+    site = web.TCPSite(
+        web_runner,
+        "0.0.0.0",
+        PORT,
+    )
+    await site.start()
+
+    print(f"HTTP server listening on port {PORT}")
 
 
 async def get_guild_plan(guild_id: int) -> str:
@@ -697,21 +1209,526 @@ async def redeem_code(interaction: discord.Interaction, code: str):
     )
 
 
-@bot.tree.command(
+class CheckoutLinkView(discord.ui.View):
+    def __init__(self, url: str):
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                label="Pay securely with Razorpay",
+                emoji="💳",
+                style=discord.ButtonStyle.link,
+                url=url,
+            )
+        )
+
+
+class UpgradeView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the administrator who opened this panel can use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def create_checkout(
+        self,
+        interaction: discord.Interaction,
+        cycle: str,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            result = await create_razorpay_subscription(
+                self.guild_id,
+                interaction.user.id,
+                cycle,
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                "❌ I couldn't create the checkout link.\n"
+                f"`{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
+            return
+
+        short_url = result.get("short_url")
+        if not short_url:
+            await interaction.followup.send(
+                "❌ Razorpay did not return a payment link.",
+                ephemeral=True,
+            )
+            return
+
+        price_text = (
+            "₹199/month"
+            if cycle == "monthly"
+            else "₹1,999/year"
+        )
+
+        await interaction.followup.send(
+            f"💎 **Frost Scribe Pro — {cycle.title()}**\n"
+            f"Price: **{price_text}**\n\n"
+            "Complete the secure Razorpay checkout below. "
+            "Pro activates automatically after Razorpay confirms payment.",
+            view=CheckoutLinkView(short_url),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Monthly ₹199",
+        emoji="📅",
+        style=discord.ButtonStyle.primary,
+    )
+    async def monthly_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.create_checkout(
+            interaction,
+            "monthly",
+        )
+
+    @discord.ui.button(
+        label="Annual ₹1,999",
+        emoji="💎",
+        style=discord.ButtonStyle.success,
+    )
+    async def annual_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.create_checkout(
+            interaction,
+            "annual",
+        )
+
+
+@plan_group.command(
     name="upgrade",
-    description="See Frost Scribe Pro options",
+    description="Upgrade this server to Frost Scribe Pro",
 )
-async def upgrade(interaction: discord.Interaction):
+@app_commands.checks.has_permissions(manage_guild=True)
+async def plan_upgrade(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not razorpay_configured():
+        await interaction.response.send_message(
+            "⚠️ Billing is not fully configured yet.",
+            ephemeral=True,
+        )
+        return
+
+    row = await db_pool.fetchrow(
+        """
+        SELECT plan, entitlement_source, razorpay_subscription_id
+        FROM guilds
+        WHERE guild_id = $1
+        """,
+        interaction.guild.id,
+    )
+
+    if row and (row["entitlement_source"] or "").upper() == "LIFETIME_PROMO":
+        await interaction.response.send_message(
+            "👑 This server already has **Lifetime Pro**. No payment is required.",
+            ephemeral=True,
+        )
+        return
+
+    if await is_pro_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "💎 This server already has an active Pro plan. "
+            "Use `/plan billing` for billing details.",
+            ephemeral=True,
+        )
+        return
+
+    annual_saving = 199 * 12 - 1999
+
+    embed = discord.Embed(
+        title="💎 Frost Scribe Pro",
+        description=(
+            "**Monthly — ₹199/month**\n"
+            "Flexible monthly subscription.\n\n"
+            "**Annual — ₹1,999/year**\n"
+            f"Save **₹{annual_saving}/year** compared with monthly billing.\n\n"
+            "**Pro includes**\n"
+            "• AI transcription\n"
+            "• AI meeting summaries\n"
+            "• Key discussion points\n"
+            "• Decisions and action items"
+        ),
+    )
+
     await interaction.response.send_message(
-        "💎 **Frost Scribe Pro**\n\n"
-        "**Monthly** — flexible month-to-month subscription\n"
-        "**Annual** — discounted yearly subscription\n\n"
-        "**Pro includes:**\n"
-        "• AI transcription\n"
-        "• AI meeting summaries\n"
-        "• Key discussion points\n"
-        "• Decisions and action items\n\n"
-        "Payment checkout will be connected next.",
+        embed=embed,
+        view=UpgradeView(
+            interaction.user.id,
+            interaction.guild.id,
+        ),
+        ephemeral=True,
+    )
+
+
+@plan_group.command(
+    name="billing",
+    description="Show this server's subscription and renewal details",
+)
+async def plan_billing(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    await ensure_guild(interaction.guild.id)
+
+    guild_row = await db_pool.fetchrow(
+        """
+        SELECT plan, subscription_status, billing_cycle,
+               subscription_expires_at, entitlement_source,
+               razorpay_subscription_id, cancel_at_cycle_end
+        FROM guilds
+        WHERE guild_id = $1
+        """,
+        interaction.guild.id,
+    )
+
+    if (
+        guild_row
+        and (guild_row["entitlement_source"] or "").upper()
+        == "LIFETIME_PROMO"
+    ):
+        await interaction.response.send_message(
+            "👑 **Lifetime Pro**\n"
+            "No billing, renewal, or expiry applies to this server.",
+            ephemeral=True,
+        )
+        return
+
+    subscription_id = (
+        guild_row["razorpay_subscription_id"]
+        if guild_row
+        else None
+    )
+
+    if not subscription_id:
+        latest = await db_pool.fetchrow(
+            """
+            SELECT *
+            FROM guild_subscriptions
+            WHERE guild_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            interaction.guild.id,
+        )
+
+        if not latest:
+            await interaction.response.send_message(
+                "❄️ This server has no paid subscription yet. "
+                "Use `/plan upgrade`.",
+                ephemeral=True,
+            )
+            return
+
+        status = latest["status"]
+        cycle = latest["billing_cycle"]
+        period_end = latest["current_period_end"]
+        cancel_pending = latest["cancel_at_cycle_end"]
+        subscription_id = latest["subscription_id"]
+    else:
+        latest = await db_pool.fetchrow(
+            """
+            SELECT *
+            FROM guild_subscriptions
+            WHERE subscription_id = $1
+            """,
+            subscription_id,
+        )
+        status = (
+            latest["status"]
+            if latest
+            else guild_row["subscription_status"]
+        )
+        cycle = (
+            latest["billing_cycle"]
+            if latest
+            else guild_row["billing_cycle"]
+        )
+        period_end = (
+            latest["current_period_end"]
+            if latest
+            else guild_row["subscription_expires_at"]
+        )
+        cancel_pending = (
+            latest["cancel_at_cycle_end"]
+            if latest
+            else guild_row["cancel_at_cycle_end"]
+        )
+
+    renewal = (
+        discord_time(period_end, "F")
+        if period_end
+        else "Pending Razorpay confirmation"
+    )
+
+    await interaction.response.send_message(
+        "💳 **Frost Scribe Billing**\n"
+        f"Plan: **Pro {str(cycle).title()}**\n"
+        f"Status: **{status}**\n"
+        f"Next renewal/end: {renewal}\n"
+        f"Cancel at cycle end: **{'Yes' if cancel_pending else 'No'}**\n"
+        f"Subscription: `{subscription_id}`",
+        ephemeral=True,
+    )
+
+
+@plan_group.command(
+    name="cancel",
+    description="Cancel Pro renewal at the end of the current billing cycle",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def plan_cancel(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    row = await db_pool.fetchrow(
+        """
+        SELECT entitlement_source, razorpay_subscription_id
+        FROM guilds
+        WHERE guild_id = $1
+        """,
+        interaction.guild.id,
+    )
+
+    if row and (row["entitlement_source"] or "").upper() == "LIFETIME_PROMO":
+        await interaction.response.send_message(
+            "👑 Lifetime Pro has no recurring billing to cancel.",
+            ephemeral=True,
+        )
+        return
+
+    subscription_id = row["razorpay_subscription_id"] if row else None
+
+    if not subscription_id:
+        latest = await db_pool.fetchrow(
+            """
+            SELECT subscription_id
+            FROM guild_subscriptions
+            WHERE guild_id = $1
+              AND status IN ('created','authenticated','active','pending')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            interaction.guild.id,
+        )
+        subscription_id = latest["subscription_id"] if latest else None
+
+    if not subscription_id:
+        await interaction.response.send_message(
+            "There is no active paid subscription to cancel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        result = await razorpay_request(
+            "POST",
+            f"/subscriptions/{subscription_id}/cancel",
+            {"cancel_at_cycle_end": 1},
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            "❌ I couldn't schedule the cancellation.\n"
+            f"`{type(e).__name__}: {e}`",
+            ephemeral=True,
+        )
+        return
+
+    await db_pool.execute(
+        """
+        UPDATE guild_subscriptions
+        SET cancel_at_cycle_end = TRUE,
+            status = $2,
+            updated_at = NOW()
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+        result.get("status", "active"),
+    )
+
+    await db_pool.execute(
+        """
+        UPDATE guilds
+        SET cancel_at_cycle_end = TRUE,
+            updated_at = NOW()
+        WHERE guild_id = $1
+        """,
+        interaction.guild.id,
+    )
+
+    await interaction.followup.send(
+        "✅ **Cancellation scheduled.**\n"
+        "Pro remains available through the current paid period. "
+        "It will not renew afterward.",
+        ephemeral=True,
+    )
+
+
+class DonationCustomModal(
+    discord.ui.Modal,
+    title="Support Frost Scribe",
+):
+    amount = discord.ui.TextInput(
+        label="Donation amount in INR",
+        placeholder="Example: 250",
+        max_length=6,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount_inr = int(str(self.amount).strip())
+            result = await create_donation_link(
+                interaction.guild_id,
+                interaction.user.id,
+                amount_inr,
+            )
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}",
+                ephemeral=True,
+            )
+            return
+        except Exception as e:
+            await interaction.response.send_message(
+                "❌ I couldn't create the donation link.\n"
+                f"`{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"❤️ **Thank you for supporting Frost Scribe.**\n"
+            f"Donation: **₹{amount_inr}**",
+            view=CheckoutLinkView(result["short_url"]),
+            ephemeral=True,
+        )
+
+
+class DonationView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Open your own `/donate` panel to donate.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def fixed_amount(
+        self,
+        interaction: discord.Interaction,
+        amount_inr: int,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            result = await create_donation_link(
+                interaction.guild_id,
+                interaction.user.id,
+                amount_inr,
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                "❌ I couldn't create the donation link.\n"
+                f"`{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"❤️ **Thank you for supporting Frost Scribe.**\n"
+            f"Donation: **₹{amount_inr}**\n\n"
+            "Donations are optional and do not change your Free/Pro entitlement.",
+            view=CheckoutLinkView(result["short_url"]),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="₹99",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def donate_99(self, interaction, button):
+        await self.fixed_amount(interaction, 99)
+
+    @discord.ui.button(
+        label="₹199",
+        style=discord.ButtonStyle.primary,
+    )
+    async def donate_199(self, interaction, button):
+        await self.fixed_amount(interaction, 199)
+
+    @discord.ui.button(
+        label="₹499",
+        style=discord.ButtonStyle.success,
+    )
+    async def donate_499(self, interaction, button):
+        await self.fixed_amount(interaction, 499)
+
+    @discord.ui.button(
+        label="Custom",
+        emoji="✍️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def donate_custom(self, interaction, button):
+        await interaction.response.send_modal(
+            DonationCustomModal()
+        )
+
+
+@bot.tree.command(
+    name="donate",
+    description="Support Frost Scribe with an optional one-time donation",
+)
+async def donate(interaction: discord.Interaction):
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        await interaction.response.send_message(
+            "⚠️ Donations are not configured yet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "❤️ **Support Frost Scribe**\n\n"
+        "Donations help with hosting, development, and AI infrastructure.\n"
+        "**Donations do not unlock Pro features.**\n\n"
+        "Choose an amount:",
+        view=DonationView(interaction.user.id),
         ephemeral=True,
     )
 
