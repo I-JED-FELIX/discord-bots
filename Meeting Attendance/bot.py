@@ -1,4 +1,4 @@
-# Frost Scribe V15 — Pro Polls With or Without Audio + Excel Reports + Single Meeting Audio
+# Frost Scribe V16 — AI Excel Dashboard + Standalone Pro Polls + Stage Audio
 import os
 import csv
 import asyncio
@@ -10,7 +10,10 @@ import json
 import hmac
 import hashlib
 import shutil
+import subprocess
 import traceback
+import re
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from pathlib import Path
@@ -23,14 +26,25 @@ from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
 
 try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.chart import BarChart, PieChart, Reference
     OPENPYXL_AVAILABLE = True
 except ImportError:
     Workbook = None
+    load_workbook = None
     Font = None
     Alignment = None
+    PatternFill = None
+    Border = None
+    Side = None
+    Table = None
+    TableStyleInfo = None
+    BarChart = None
+    PieChart = None
+    Reference = None
     get_column_letter = None
     OPENPYXL_AVAILABLE = False
 
@@ -462,8 +476,9 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
     2. One compact mixed meeting WAV for the Discord user-facing recording.
 
     The mixed track uses 20 ms time buckets. Packets that overlap in time are
-    mixed together with 16-bit saturation. Long periods with nobody speaking
-    are capped to a short pause so the exported file stays reasonably small.
+    mixed together with 16-bit saturation. The full meeting timeline is
+    preserved, including silence between speakers; the final user-facing copy
+    is compressed to one Ogg/Opus file for Discord delivery.
     """
 
     CHANNELS = 2
@@ -473,7 +488,6 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
     MIX_SLOT_FRAMES = int(SAMPLE_RATE * MIX_SLOT_SECONDS)  # 960 frames
     MIX_SLOT_BYTES = MIX_SLOT_FRAMES * CHANNELS * SAMPLE_WIDTH
     MIX_JITTER_SLOTS = 10  # ~200 ms reorder/jitter allowance
-    MAX_SILENCE_SLOTS = 50  # preserve at most ~1 second of dead air per gap
 
     def __init__(self, folder: Path):
         super().__init__()
@@ -560,7 +574,27 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
 
         # RTP audio timestamps are expressed in 48 kHz sample frames.
         delta_slots = int(round(delta_frames / self.MIX_SLOT_FRAMES))
-        return max(0, base_slot + delta_slots)
+        candidate = max(0, base_slot + delta_slots)
+
+        # Stage/voice RTP timestamps can occasionally reset after mute/unmute or
+        # a stream transition. Do not let a timestamp discontinuity create an
+        # enormous artificial silence gap in the master recording.
+        if abs(candidate - now_slot) > 250:  # > ~5 seconds away from wall time
+            self._user_rtp_bases[uid] = (timestamp, now_slot)
+            return now_slot
+
+        return candidate
+
+    def _write_silence_slots_locked(self, slot_count: int):
+        """Write exact timeline silence without allocating one huge buffer."""
+        remaining = max(0, int(slot_count))
+        chunk_slots = 250  # ~5 seconds per write
+        while remaining > 0:
+            count = min(remaining, chunk_slots)
+            self._mix_writer.writeframes(
+                b"\x00" * (count * self.MIX_SLOT_BYTES)
+            )
+            remaining -= count
 
     def _flush_mix_slots_locked(self, cutoff_slot: int | None = None):
         if cutoff_slot is None:
@@ -576,10 +610,9 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
             if self._mix_last_written_slot is not None:
                 missing = slot - self._mix_last_written_slot - 1
                 if missing > 0:
-                    silence_slots = min(missing, self.MAX_SILENCE_SLOTS)
-                    self._mix_writer.writeframes(
-                        b"\x00" * (silence_slots * self.MIX_SLOT_BYTES)
-                    )
+                    # V17 preserves the real meeting timeline rather than
+                    # shortening long periods of silence.
+                    self._write_silence_slots_locked(missing)
 
             self._mix_writer.writeframes(pcm)
             self._mix_last_written_slot = slot
@@ -3567,64 +3600,568 @@ def build_pro_excel_report(meeting, rows, ended_at):
     return report_path
 
 
+# ---------------------------------------------------------------------------
+# Pro AI Excel dashboard
+# ---------------------------------------------------------------------------
+_AI_STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "from", "have", "has", "had",
+    "was", "were", "are", "but", "not", "you", "your", "they", "their", "them",
+    "our", "out", "all", "can", "could", "would", "should", "will", "just", "about",
+    "into", "over", "under", "than", "then", "there", "here", "what", "when", "where",
+    "who", "why", "how", "which", "while", "also", "been", "being", "because", "very",
+    "some", "more", "most", "much", "many", "any", "each", "only", "other", "another",
+    "such", "same", "between", "through", "during", "before", "after", "above", "below",
+    "again", "further", "once", "does", "did", "doing", "done", "make", "made", "get",
+    "got", "need", "needs", "needed", "want", "wants", "wanted", "say", "says", "said",
+    "use", "used", "using", "one", "two", "three", "yes", "yeah", "okay", "ok", "like",
+    "really", "think", "know", "going", "thing", "things", "meeting", "discussion", "speaker",
+    "none", "identified", "vote", "votes", "poll", "results"
+}
+
+
+def _split_transcript_by_speaker(transcript: str):
+    """Return [(speaker, text), ...] from Frost Scribe's speaker-headed transcript."""
+    sections = []
+    current_speaker = None
+    current_lines = []
+
+    for raw_line in (transcript or "").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("### "):
+            if current_speaker is not None:
+                sections.append((current_speaker, "\n".join(current_lines).strip()))
+            current_speaker = line[4:].strip() or "Unknown"
+            current_lines = []
+        elif current_speaker is not None:
+            current_lines.append(line)
+
+    if current_speaker is not None:
+        sections.append((current_speaker, "\n".join(current_lines).strip()))
+
+    if not sections and transcript:
+        sections.append(("Meeting", transcript.strip()))
+    return sections
+
+
+def _keyword_tokens(text: str):
+    # Unicode letters, 3+ chars. Keeps non-English words where possible.
+    words = re.findall(r"[^\W\d_]{3,}", (text or "").casefold(), flags=re.UNICODE)
+    return [w for w in words if w not in _AI_STOPWORDS]
+
+
+def _top_keywords(text: str, limit=60):
+    return Counter(_keyword_tokens(text)).most_common(limit)
+
+
+def _parse_ai_summary_sections(summary: str):
+    """Parse the known Frost Scribe markdown headings into filterable rows."""
+    sections = defaultdict(list)
+    current = "Executive Summary"
+    buffer = []
+
+    def flush():
+        nonlocal buffer
+        if not buffer:
+            return
+        text = "\n".join(buffer).strip()
+        if text:
+            # Prefer bullet granularity for filtering; preserve paragraphs otherwise.
+            bullets = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("- ", "• ", "* ")):
+                    bullets.append(stripped[2:].strip())
+                elif stripped:
+                    bullets.append(stripped)
+            for item in bullets:
+                if item and item.casefold() not in {"none identified.", "none identified", "none."}:
+                    sections[current].append(item)
+        buffer = []
+
+    for raw_line in (summary or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            flush()
+            current = line[3:].strip()
+        else:
+            buffer.append(raw_line)
+    flush()
+    return dict(sections)
+
+
+def _summary_rows(summary: str):
+    sections = _parse_ai_summary_sections(summary)
+    rows = []
+    for category, items in sections.items():
+        for item in items:
+            kws = [kw for kw, _ in _top_keywords(item, limit=6)]
+            rows.append({
+                "category": category,
+                "item": item,
+                "keywords": ", ".join(kws),
+            })
+    return rows, sections
+
+
+
+def _parse_action_item(text: str):
+    """Best-effort parse of the summary format: Owner — task — deadline."""
+    parts = [p.strip() for p in re.split(r"\s+[—–-]\s+", text or "", maxsplit=2) if p.strip()]
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return parts[0], parts[1], ""
+    return "", (text or "").strip(), ""
+
+
+def _safe_table(ws, ref: str, name: str):
+    if Table is None or TableStyleInfo is None:
+        return
+    try:
+        tab = Table(displayName=name, ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(tab)
+    except Exception as exc:
+        print(f"Could not add Excel table {name}: {type(exc).__name__}: {exc}")
+
+
+def _dashboard_header(ws, title: str, subtitle: str = ""):
+    ws.merge_cells("A1:H1")
+    ws["A1"] = title
+    ws["A1"].font = Font(size=20, bold=True, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="0B1F33")
+    ws["A1"].alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 30
+    if subtitle:
+        ws.merge_cells("A2:H2")
+        ws["A2"] = subtitle
+        ws["A2"].font = Font(italic=True, color="5B6573")
+        ws["A2"].alignment = Alignment(wrap_text=True)
+
+
+def _kpi_cell(ws, cell: str, label: str, value):
+    ws[cell] = label
+    ws[cell].font = Font(bold=True, color="FFFFFF")
+    ws[cell].fill = PatternFill("solid", fgColor="1877A8")
+    below = ws.cell(row=ws[cell].row + 1, column=ws[cell].column)
+    below.value = value
+    below.font = Font(size=16, bold=True, color="0B1F33")
+    below.alignment = Alignment(horizontal="center")
+    below.fill = PatternFill("solid", fgColor="EAF5FB")
+    thin = Side(style="thin", color="B8D7E8")
+    ws[cell].border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    below.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws[cell].alignment = Alignment(horizontal="center")
+
+
+def enhance_pro_excel_with_ai(report_path: Path, meeting, rows, ended_at, transcript: str, summary: str):
+    """
+    Add an AI analysis dashboard to the existing Pro workbook.
+
+    The dashboard is deliberately based on the already-generated AI summary plus
+    deterministic keyword counts from the full transcript. This avoids a second
+    expensive LLM pass for a long (for example 3-hour) meeting while still making
+    the workbook easy to filter and analyze.
+    """
+    if not OPENPYXL_AVAILABLE or load_workbook is None:
+        raise RuntimeError("openpyxl is required for the AI Excel dashboard.")
+    report_path = Path(report_path)
+    if report_path.suffix.casefold() != ".xlsx" or not report_path.exists():
+        raise RuntimeError("AI dashboard requires the Pro .xlsx meeting report.")
+
+    workbook = load_workbook(report_path)
+    for sheet_name in [
+        "AI Dashboard", "AI Summary Detail", "Topics", "Decisions",
+        "Action Items", "Risks & Questions", "Keyword Index",
+        "Speaker Insights", "Speaker Transcript"
+    ]:
+        if sheet_name in workbook.sheetnames:
+            del workbook[sheet_name]
+
+    summary_rows, parsed_sections = _summary_rows(summary)
+    speaker_sections = _split_transcript_by_speaker(transcript)
+    keyword_counts = _top_keywords(transcript, limit=100)
+
+    decisions = parsed_sections.get("Decisions Made", [])
+    actions = parsed_sections.get("Action Items", [])
+    risks = parsed_sections.get("Open Questions / Risks", [])
+    topics = parsed_sections.get("Key Discussion Points", [])
+
+    # ---------------- Dashboard ----------------
+    dash = workbook.create_sheet("AI Dashboard", 0)
+    _dashboard_header(
+        dash,
+        f"Frost Scribe AI Dashboard — {meeting['name']}",
+        "Use the filter dropdowns in AI Summary Detail, Keyword Index, Speaker Insights, "
+        "Attendance, and Poll sheets to drill into a long meeting quickly.",
+    )
+
+    duration_min = round((ended_at - meeting["started_at"]).total_seconds() / 60.0, 1)
+    _kpi_cell(dash, "A4", "Duration (min)", duration_min)
+    _kpi_cell(dash, "C4", "Attendees", len(rows))
+    _kpi_cell(dash, "E4", "Speakers captured", len(speaker_sections))
+    _kpi_cell(dash, "G4", "Polls", len(meeting.get("polls", {})))
+    _kpi_cell(dash, "A7", "Key topics", len(topics))
+    _kpi_cell(dash, "C7", "Decisions", len(decisions))
+    _kpi_cell(dash, "E7", "Action items", len(actions))
+    _kpi_cell(dash, "G7", "Open risks/questions", len(risks))
+
+    dash["A10"] = "Executive Summary"
+    dash["A10"].font = Font(size=14, bold=True, color="0B1F33")
+    dash.merge_cells("A11:H15")
+    executive = parsed_sections.get("Executive Summary", [])
+    dash["A11"] = "\n".join(executive) if executive else (summary[:2500] if summary else "No AI summary available.")
+    dash["A11"].alignment = Alignment(vertical="top", wrap_text=True)
+    dash["A11"].fill = PatternFill("solid", fgColor="F4F8FB")
+
+    dash["A17"] = "Top Keywords"
+    dash["A17"].font = Font(size=14, bold=True, color="0B1F33")
+    dash.append([])  # harmless; ensures dimensions remain normal
+    dash["A18"] = "Keyword"
+    dash["B18"] = "Occurrences"
+    for c in dash[18][:2]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="1877A8")
+    top20 = keyword_counts[:20]
+    for idx, (kw, count) in enumerate(top20, start=19):
+        dash.cell(idx, 1, kw)
+        dash.cell(idx, 2, count)
+
+    dash["D17"] = "How to analyze"
+    dash["D17"].font = Font(size=14, bold=True, color="0B1F33")
+    dash.merge_cells("D18:H24")
+    dash["D18"] = (
+        "1. Open Keyword Index and use the Excel filter search box to find any term.\n"
+        "2. Open AI Summary Detail and filter Category to Decisions, Action Items, Risks, or Topics.\n"
+        "3. Filter Speaker Insights to see each speaker's main themes.\n"
+        "4. Speaker Transcript keeps the full speaker-level text searchable with Excel's filter/search tools.\n"
+        "5. Attendance and Poll sheets remain linked in the same workbook."
+    )
+    dash["D18"].alignment = Alignment(vertical="top", wrap_text=True)
+    dash["D18"].fill = PatternFill("solid", fgColor="F4F8FB")
+
+    for col, width in {"A": 22, "B": 14, "C": 4, "D": 18, "E": 18, "F": 18, "G": 18, "H": 18}.items():
+        dash.column_dimensions[col].width = width
+    dash.freeze_panes = "A4"
+
+    if BarChart is not None and Reference is not None and top20:
+        try:
+            chart = BarChart()
+            chart.type = "bar"
+            chart.style = 10
+            chart.title = "Most Mentioned Keywords"
+            chart.y_axis.title = "Keyword"
+            chart.x_axis.title = "Occurrences"
+            data = Reference(dash, min_col=2, min_row=18, max_row=18 + min(10, len(top20)))
+            cats = Reference(dash, min_col=1, min_row=19, max_row=18 + min(10, len(top20)))
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.height = 7.2
+            chart.width = 11
+            dash.add_chart(chart, "D26")
+        except Exception as exc:
+            print(f"Could not add dashboard keyword chart: {type(exc).__name__}: {exc}")
+
+    # ---------------- AI Summary Detail ----------------
+    detail = workbook.create_sheet("AI Summary Detail")
+    detail.append(["Category", "AI Finding", "Keywords"])
+    if summary_rows:
+        for item in summary_rows:
+            detail.append([item["category"], item["item"], item["keywords"]])
+    else:
+        detail.append(["Summary", "No structured AI findings were available.", ""])
+    _style_excel_sheet(detail)
+    detail.column_dimensions["A"].width = 28
+    detail.column_dimensions["B"].width = 90
+    detail.column_dimensions["C"].width = 38
+    _safe_table(detail, f"A1:C{detail.max_row}", "AISummaryDetailTable")
+
+
+    # ---------------- Dedicated analysis sheets ----------------
+    topics_ws = workbook.create_sheet("Topics")
+    topics_ws.append(["Topic / Discussion Point", "Keywords"])
+    for item in topics:
+        topics_ws.append([item, ", ".join(kw for kw, _ in _top_keywords(item, limit=8))])
+    if topics_ws.max_row == 1:
+        topics_ws.append(["No key discussion points identified.", ""])
+    _style_excel_sheet(topics_ws)
+    topics_ws.column_dimensions["A"].width = 100
+    topics_ws.column_dimensions["B"].width = 45
+    _safe_table(topics_ws, f"A1:B{topics_ws.max_row}", "TopicsTable")
+
+    decisions_ws = workbook.create_sheet("Decisions")
+    decisions_ws.append(["Decision", "Keywords"])
+    for item in decisions:
+        decisions_ws.append([item, ", ".join(kw for kw, _ in _top_keywords(item, limit=8))])
+    if decisions_ws.max_row == 1:
+        decisions_ws.append(["No decisions identified.", ""])
+    _style_excel_sheet(decisions_ws)
+    decisions_ws.column_dimensions["A"].width = 100
+    decisions_ws.column_dimensions["B"].width = 45
+    _safe_table(decisions_ws, f"A1:B{decisions_ws.max_row}", "DecisionsTable")
+
+    actions_ws = workbook.create_sheet("Action Items")
+    actions_ws.append(["Owner", "Action", "Deadline", "Keywords", "Status"])
+    for item in actions:
+        owner, task, deadline = _parse_action_item(item)
+        actions_ws.append([
+            owner, task, deadline,
+            ", ".join(kw for kw, _ in _top_keywords(item, limit=8)),
+            "Open",
+        ])
+    if actions_ws.max_row == 1:
+        actions_ws.append(["", "No action items identified.", "", "", ""])
+    _style_excel_sheet(actions_ws)
+    for col, width in {"A": 28, "B": 80, "C": 26, "D": 45, "E": 14}.items():
+        actions_ws.column_dimensions[col].width = width
+    _safe_table(actions_ws, f"A1:E{actions_ws.max_row}", "ActionItemsTable")
+
+    risks_ws = workbook.create_sheet("Risks & Questions")
+    risks_ws.append(["Open Question / Risk", "Keywords"])
+    for item in risks:
+        risks_ws.append([item, ", ".join(kw for kw, _ in _top_keywords(item, limit=8))])
+    if risks_ws.max_row == 1:
+        risks_ws.append(["No open questions or risks identified.", ""])
+    _style_excel_sheet(risks_ws)
+    risks_ws.column_dimensions["A"].width = 100
+    risks_ws.column_dimensions["B"].width = 45
+    _safe_table(risks_ws, f"A1:B{risks_ws.max_row}", "RisksQuestionsTable")
+
+    # ---------------- Keyword Index ----------------
+    keyword_ws = workbook.create_sheet("Keyword Index")
+    keyword_ws.append(["Keyword", "Occurrences", "Speaker Count", "Speakers", "Related AI Categories"])
+    speaker_token_sets = {
+        speaker: Counter(_keyword_tokens(text))
+        for speaker, text in speaker_sections
+    }
+    for kw, count in keyword_counts:
+        speakers = [speaker for speaker, counts in speaker_token_sets.items() if counts.get(kw, 0) > 0]
+        related_categories = sorted({
+            item["category"] for item in summary_rows
+            if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", item["item"].casefold())
+            or kw in [x.strip() for x in item["keywords"].split(",") if x.strip()]
+        })
+        keyword_ws.append([
+            kw, count, len(speakers), ", ".join(speakers), ", ".join(related_categories)
+        ])
+    _style_excel_sheet(keyword_ws)
+    keyword_ws.column_dimensions["A"].width = 24
+    keyword_ws.column_dimensions["B"].width = 14
+    keyword_ws.column_dimensions["C"].width = 14
+    keyword_ws.column_dimensions["D"].width = 50
+    keyword_ws.column_dimensions["E"].width = 45
+    _safe_table(keyword_ws, f"A1:E{max(2, keyword_ws.max_row)}", "KeywordIndexTable")
+    if keyword_ws.max_row >= 2:
+        try:
+            keyword_ws.conditional_formatting.add(
+                f"B2:B{keyword_ws.max_row}",
+                # openpyxl data bars are supported without another dependency
+                __import__("openpyxl.formatting.rule", fromlist=["DataBarRule"]).DataBarRule(
+                    start_type="min", end_type="max", color="63C5DA", showValue=True
+                )
+            )
+        except Exception:
+            pass
+
+    # ---------------- Speaker Insights ----------------
+    speaker_ws = workbook.create_sheet("Speaker Insights")
+    speaker_ws.append(["Speaker", "Word Count", "Top Keywords", "Transcript Preview"])
+    for speaker, text in speaker_sections:
+        kws = ", ".join(kw for kw, _ in _top_keywords(text, limit=10))
+        preview = re.sub(r"\s+", " ", text).strip()[:700]
+        speaker_ws.append([speaker, len(text.split()), kws, preview])
+    _style_excel_sheet(speaker_ws)
+    speaker_ws.column_dimensions["A"].width = 28
+    speaker_ws.column_dimensions["B"].width = 14
+    speaker_ws.column_dimensions["C"].width = 60
+    speaker_ws.column_dimensions["D"].width = 95
+    _safe_table(speaker_ws, f"A1:D{max(2, speaker_ws.max_row)}", "SpeakerInsightsTable")
+
+    # ---------------- Searchable transcript ----------------
+    transcript_ws = workbook.create_sheet("Speaker Transcript")
+    transcript_ws.append(["Speaker", "Transcript Text"])
+    for speaker, text in speaker_sections:
+        # Excel cell limit is 32,767 chars. Split a very long speaker transcript
+        # into continuation rows so a 3-hour meeting remains valid/searchable.
+        if not text:
+            transcript_ws.append([speaker, ""])
+            continue
+        chunk_size = 30000
+        for index in range(0, len(text), chunk_size):
+            label = speaker if index == 0 else f"{speaker} (cont.)"
+            transcript_ws.append([label, text[index:index + chunk_size]])
+    _style_excel_sheet(transcript_ws)
+    transcript_ws.column_dimensions["A"].width = 30
+    transcript_ws.column_dimensions["B"].width = 120
+    _safe_table(transcript_ws, f"A1:B{max(2, transcript_ws.max_row)}", "SpeakerTranscriptTable")
+
+
+    # Add filterable tables to the core Pro sheets too, where possible.
+    for sheet_name, table_name in [
+        ("Attendance", "AttendanceTable"),
+        ("Poll Summary", "MeetingPollSummaryTable"),
+        ("Voter Detail", "MeetingVoterDetailTable"),
+        ("Poll Participation", "MeetingPollParticipationTable"),
+    ]:
+        if sheet_name in workbook.sheetnames:
+            ws = workbook[sheet_name]
+            if ws.max_row >= 2 and ws.max_column >= 1 and not ws.tables:
+                ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+                _safe_table(ws, ref, table_name)
+
+    # Put workbook sheets into a logical analyst-friendly order.
+    preferred_order = [
+        "AI Dashboard", "AI Summary Detail", "Topics", "Decisions", "Action Items",
+        "Risks & Questions", "Keyword Index", "Speaker Insights",
+        "Meeting Overview", "Attendance", "Poll Summary", "Voter Detail",
+        "Poll Participation", "Speaker Transcript"
+    ]
+    ordered = [workbook[name] for name in preferred_order if name in workbook.sheetnames]
+    ordered += [ws for ws in workbook.worksheets if ws.title not in preferred_order]
+    workbook._sheets = ordered
+
+    workbook.save(report_path)
+    return report_path
+
+
+def encode_master_recording_for_discord(
+    wav_path: Path,
+    meeting_seconds: float,
+    *,
+    target_bytes: int = 18 * 1024 * 1024,
+) -> Path:
+    """
+    Encode the chronological master WAV to one Ogg/Opus speech recording.
+
+    The bitrate is selected from meeting duration so even a 180-minute Pro
+    meeting targets one Discord-friendly attachment instead of dozens of WAV
+    chunks. Per-speaker WAVs remain untouched for speaker-aware transcription.
+    """
+    if not wav_path.exists() or wav_path.stat().st_size <= 44:
+        raise RuntimeError("The combined WAV contains no usable audio.")
+
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise RuntimeError(
+            "imageio-ffmpeg is not installed. Add "
+            "imageio-ffmpeg>=0.6.0 to requirements.txt."
+        ) from exc
+
+    duration = max(1.0, float(meeting_seconds or 1.0))
+
+    # Leave container/metadata headroom. Clamp for speech quality and ensure
+    # the 180-minute Pro limit can still fit in a single ~18 MiB target file.
+    budget_bits_per_second = int((target_bytes * 8 * 0.92) / duration)
+    bitrate_kbps = max(8, min(64, budget_bits_per_second // 1000))
+
+    output_path = wav_path.with_name("meeting_audio.ogg")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+    def run_encode(kbps: int):
+        command = [
+            ffmpeg_exe,
+            "-y",
+            "-loglevel", "error",
+            "-i", str(wav_path),
+            "-vn",
+            "-ac", "1",
+            "-ar", "24000",
+            "-c:a", "libopus",
+            "-application", "voip",
+            "-b:a", f"{kbps}k",
+            "-vbr", "on",
+            "-compression_level", "10",
+            str(output_path),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(120, int(duration / 4)),
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "ffmpeg failed").strip()
+            raise RuntimeError(detail[-1500:])
+
+    run_encode(bitrate_kbps)
+
+    # If variable bitrate overshoots the target, retry at the minimum speech
+    # bitrate. 8 kbps Opus is intentionally reserved as the safety fallback.
+    if output_path.stat().st_size > target_bytes and bitrate_kbps > 8:
+        run_encode(8)
+
+    if output_path.stat().st_size > target_bytes:
+        raise RuntimeError(
+            f"Compressed master is still {output_path.stat().st_size / 1024 / 1024:.1f} MiB. "
+            "A storage/link delivery backend is required for this recording."
+        )
+
+    print(
+        "Encoded single master recording: "
+        f"{output_path.name} at ~{bitrate_kbps} kbps, "
+        f"{output_path.stat().st_size / 1024 / 1024:.1f} MiB"
+    )
+    return output_path
+
+
 async def send_recording_files(channel, meeting):
     """
-    Send one combined meeting recording instead of one WAV per speaker.
+    Send exactly one combined full-meeting audio file.
 
-    Internal per-speaker tracks remain temporary and are used only for Pro AI
-    transcription. If the combined WAV exceeds the upload-safe chunk size, it
-    is split into sequential parts as a fallback.
+    V17 no longer splits the user-facing recording into WAV chunks. The raw
+    combined WAV preserves the full meeting timeline and is compressed to one
+    Ogg/Opus speech file before upload. Temporary per-speaker WAV tracks remain
+    internal for speaker-aware transcription only.
     """
     sink = meeting.get("audio_sink")
     if sink is None:
         return 0
 
-    path = getattr(sink, "combined_path", None)
-    if path is None or not path.exists() or path.stat().st_size <= 44:
+    wav_path = getattr(sink, "combined_path", None)
+    if wav_path is None or not wav_path.exists() or wav_path.stat().st_size <= 44:
         await channel.send(
             "🎙️ No usable audio was captured for this recording."
         )
         return 0
 
+    meeting_seconds = max(
+        1.0,
+        (utcnow() - meeting["started_at"]).total_seconds(),
+    )
+
     try:
-        parts = split_wav_if_needed(path)
+        master_path = await asyncio.to_thread(
+            encode_master_recording_for_discord,
+            wav_path,
+            meeting_seconds,
+        )
     except Exception as e:
         print(
-            "Could not prepare combined recording: "
+            "Could not encode single master recording: "
             f"{type(e).__name__}: {e}"
         )
         await channel.send(
-            "⚠️ The meeting audio was captured, but I could not prepare it "
-            "for upload."
+            "⚠️ The full meeting audio was captured, but I could not compress "
+            "it into one Discord attachment.\n"
+            f"`{type(e).__name__}: {e}`"
         )
         return 0
 
-    sent = 0
-    if len(parts) == 1:
-        await channel.send(
-            "🎙️ **Meeting recording**",
-            file=discord.File(parts[0], filename=(
-                f"{safe_filename(meeting['name'])}_recording.wav"
-            )),
-        )
-        return 1
-
-    # Very long/high-speech meetings can exceed Discord's attachment size.
-    # They are still one combined recording logically, delivered in order.
-    for index, part in enumerate(parts, start=1):
-        await channel.send(
-            f"🎙️ **Meeting recording — part {index}/{len(parts)}**",
-            file=discord.File(
-                part,
-                filename=(
-                    f"{safe_filename(meeting['name'])}_recording_"
-                    f"part{index:03d}.wav"
-                ),
-            ),
-        )
-        sent += 1
-
-    return sent
+    await channel.send(
+        "🎙️ **Full meeting recording**",
+        file=discord.File(
+            master_path,
+            filename=f"{safe_filename(meeting['name'])}_recording.ogg",
+        ),
+    )
+    return 1
 
 
 def cleanup_recording_directory(path: Path):
@@ -3838,13 +4375,42 @@ async def finalize_recording(
                 if len(summary) > 1700:
                     preview += "\n\n…full summary attached."
 
+                enhanced_report_path = None
+                try:
+                    enhanced_report_path = await asyncio.to_thread(
+                        enhance_pro_excel_with_ai,
+                        report_path,
+                        meeting,
+                        rows,
+                        ended_at,
+                        transcript,
+                        summary,
+                    )
+                except Exception as dashboard_error:
+                    print(
+                        "AI Excel dashboard generation failed: "
+                        f"{type(dashboard_error).__name__}: {dashboard_error}"
+                    )
+
                 attachments = [discord.File(transcript_path)]
                 if summary_path is not None and summary_path.exists():
                     attachments.append(discord.File(summary_path))
+                if enhanced_report_path is not None and Path(enhanced_report_path).exists():
+                    attachments.append(
+                        discord.File(
+                            enhanced_report_path,
+                            filename=f"{safe_filename(meeting['name'])}_AI_dashboard.xlsx",
+                        )
+                    )
 
+                dashboard_note = (
+                    "\n\n📊 **AI Excel Dashboard attached** — filter keywords, topics, "
+                    "decisions, actions, speakers, attendance, and polls."
+                    if enhanced_report_path is not None else ""
+                )
                 await output_channel.send(
                     f"📝 **AI Meeting Summary — {meeting['name']}**\n\n"
-                    f"{preview}",
+                    f"{preview}{dashboard_note}",
                     files=attachments,
                 )
 
