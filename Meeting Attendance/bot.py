@@ -19,6 +19,54 @@ from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
+
+# ---------------------------------------------------------------------------
+# Frost Scribe Stage-channel compatibility patch
+#
+# discord-ext-voice-recv currently assumes every Discord VIDEO voice-gateway
+# stream has a non-null ``max_resolution`` object. Stage channels can send
+# stream entries where ``max_resolution`` is null. During the voice handshake
+# that makes the extension raise ``TypeError: 'NoneType' object is not
+# subscriptable`` inside voice_recv.video.VideoStreamResolution, which aborts
+# the connection before audio receiving starts.
+#
+# Frost Scribe does not consume webcam/video stream metadata; it only needs
+# the audio SSRC, which the extension registers before parsing the video
+# metadata. Therefore malformed/non-video stream descriptors can safely be
+# ignored. This patch is deliberately narrow and leaves normal voice/audio
+# packet handling unchanged.
+# ---------------------------------------------------------------------------
+try:
+    from discord.ext.voice_recv import video as _voice_recv_video
+
+    def _frost_safe_video_streams(self, streams):
+        parsed = []
+        for stream in streams or []:
+            if not isinstance(stream, dict):
+                continue
+
+            resolution = stream.get("max_resolution")
+            if not isinstance(resolution, dict):
+                # Discord Stage channels may emit a stream with
+                # max_resolution=null. We do not need video metadata.
+                continue
+
+            try:
+                parsed.append(_voice_recv_video.VideoStreamInfo(data=stream))
+            except (TypeError, KeyError, ValueError):
+                # A malformed video descriptor must never prevent audio
+                # recording from connecting.
+                continue
+
+        return parsed
+
+    _voice_recv_video.VoiceVideoStreams._get_streams = _frost_safe_video_streams
+    print("Frost Scribe Stage video-metadata compatibility patch loaded.")
+except Exception as _stage_patch_error:
+    print(
+        "Warning: Stage video-metadata compatibility patch could not load: "
+        f"{type(_stage_patch_error).__name__}: {_stage_patch_error}"
+    )
 from dotenv import load_dotenv
 from openai import OpenAI
 
