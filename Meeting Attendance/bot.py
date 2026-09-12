@@ -1,3 +1,4 @@
+# Frost Scribe V8 — Stage/Conference Channel Support
 import os
 import csv
 import asyncio
@@ -1556,7 +1557,7 @@ async def frost_help(interaction: discord.Interaction):
     embed.add_field(
         name="📋 Attendance",
         value=(
-            "`/attendance start` — Start attendance-only tracking\n"
+            "`/attendance start` — Start attendance-only tracking (Voice/Stage)\n"
             "`/attendance status` — View attendance session\n"
             "`/attendance stop` — Export attendance report"
         ),
@@ -1565,7 +1566,7 @@ async def frost_help(interaction: discord.Interaction):
     embed.add_field(
         name="🎙️ Recording",
         value=(
-            "`/record start` — Record a meeting + attendance\n"
+            "`/record start` — Record a meeting + attendance (Voice/Stage)\n"
             "`/record status` — View active recording\n"
             "`/record stop` — Stop and export results\n"
             f"Free: up to {FREE_RECORDING_LIMIT_MINUTES} min/recording. "
@@ -2452,13 +2453,13 @@ def write_attendance_csv(session, rows, ended_at):
 )
 @app_commands.describe(
     name="Attendance session name",
-    channel="Voice channel to track; leave blank to use your current channel",
+    channel="Voice or Stage channel to track; leave blank to use your current channel",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def attendance_start(
     interaction: discord.Interaction,
     name: str,
-    channel: discord.VoiceChannel | None = None,
+    channel: discord.VoiceChannel | discord.StageChannel | None = None,
 ):
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -2497,7 +2498,7 @@ async def attendance_start(
         if (
             member is not None
             and member.voice is not None
-            and isinstance(member.voice.channel, discord.VoiceChannel)
+            and isinstance(member.voice.channel, (discord.VoiceChannel, discord.StageChannel))
         ):
             channel = member.voice.channel
         else:
@@ -2509,12 +2510,12 @@ async def attendance_start(
                 interaction.guild.get_channel(default_voice_id)
                 if default_voice_id else None
             )
-            if isinstance(default_voice, discord.VoiceChannel):
+            if isinstance(default_voice, (discord.VoiceChannel, discord.StageChannel)):
                 channel = default_voice
             else:
                 await interaction.response.send_message(
-                    "Join a voice channel, specify the `channel` option, "
-                    "or configure a default voice channel with `/setup`.",
+                    "Join a voice or Stage channel, specify the `channel` option, "
+                    "or configure a default voice/Stage channel with `/setup`.",
                     ephemeral=True,
                 )
                 return
@@ -3406,13 +3407,13 @@ record_group = app_commands.Group(
 @app_commands.describe(
     name="Meeting name",
     channel=(
-        "Voice channel to record; leave blank to use your current channel"
+        "Voice or Stage channel to record; leave blank to use your current channel"
     ),
 )
 async def meeting_start(
     interaction: discord.Interaction,
     name: str,
-    channel: discord.VoiceChannel | None = None,
+    channel: discord.VoiceChannel | discord.StageChannel | None = None,
 ):
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -3449,7 +3450,7 @@ async def meeting_start(
         if (
             member is not None
             and member.voice is not None
-            and isinstance(member.voice.channel, discord.VoiceChannel)
+            and isinstance(member.voice.channel, (discord.VoiceChannel, discord.StageChannel))
         ):
             channel = member.voice.channel
         else:
@@ -3461,12 +3462,12 @@ async def meeting_start(
                 interaction.guild.get_channel(default_voice_id)
                 if default_voice_id else None
             )
-            if isinstance(default_voice, discord.VoiceChannel):
+            if isinstance(default_voice, (discord.VoiceChannel, discord.StageChannel)):
                 channel = default_voice
             else:
                 await interaction.response.send_message(
-                    "Join a voice channel, specify the `channel` option, "
-                    "or configure a default voice channel with `/setup`.",
+                    "Join a voice or Stage channel, specify the `channel` option, "
+                    "or configure a default voice/Stage channel with `/setup`.",
                     ephemeral=True,
                 )
                 return
