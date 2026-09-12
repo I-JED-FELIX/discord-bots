@@ -1,4 +1,4 @@
-# Frost Scribe V12 — Stage/Conference + DAVE + Single Meeting Audio
+# Frost Scribe V13 — Pro Meeting Polls + Excel Reports + Single Meeting Audio
 import os
 import csv
 import asyncio
@@ -21,6 +21,18 @@ from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    Workbook = None
+    Font = None
+    Alignment = None
+    get_column_letter = None
+    OPENPYXL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Frost Scribe Stage-channel compatibility patch
@@ -758,10 +770,16 @@ Only include an owner or deadline when explicitly stated.
 ## Open Questions / Risks
 Anything unresolved, blocked, uncertain, or requiring follow-up.
 
+## Poll Results
+Summarize the exact poll outcomes supplied below. Do not infer votes that are not present.
+
 Rules:
 - Never invent facts, decisions, owners, deadlines, or commitments.
 - Preserve names from the speaker headings.
 - If a section has nothing supported by the transcript, write "None identified."
+
+POLL RESULTS:
+{format_poll_results_for_ai(meeting)}
 
 TRANSCRIPT:
 {transcript}
@@ -1803,6 +1821,17 @@ async def frost_help(interaction: discord.Interaction):
             "`/record stop` — Stop and export results\n"
             f"Free: up to {FREE_RECORDING_LIMIT_MINUTES} min/recording. "
             f"Pro: up to {PRO_RECORDING_LIMIT_MINUTES} min/recording + AI."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🗳️ Pro Meeting Polls",
+        value=(
+            "`/poll create` — Create a named vote during an active recorded meeting\n"
+            "`/poll status` — View live poll results\n"
+            "`/poll close` — Close a poll early\n"
+            "Pro meeting reports include attendance, poll results, voter detail, "
+            "and non-voters in one Excel workbook."
         ),
         inline=False,
     )
@@ -3286,6 +3315,207 @@ async def before_scheduled_reminder_worker():
 
 
 
+
+def format_poll_results_for_ai(meeting):
+    polls = sorted(meeting.get("polls", {}).values(), key=lambda p: int(p["id"]))
+    if not polls:
+        return "No polls were conducted during this meeting."
+
+    blocks = []
+    for poll in polls:
+        counts = _poll_counts(poll)
+        total = sum(counts)
+        lines = [f"Poll #{poll['id']}: {poll['question']}"]
+        for index, option in enumerate(poll["options"]):
+            count = counts[index]
+            pct = (count / total * 100.0) if total else 0.0
+            lines.append(f"- {option}: {count} vote(s), {pct:.1f}%")
+        lines.append(f"Total respondents: {total}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _excel_autofit(ws, min_width=10, max_width=50):
+    if not OPENPYXL_AVAILABLE:
+        return
+    for column_cells in ws.columns:
+        length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells:
+            try:
+                value = "" if cell.value is None else str(cell.value)
+                length = max(length, max((len(line) for line in value.splitlines()), default=0))
+            except Exception:
+                pass
+        ws.column_dimensions[column_letter].width = max(min_width, min(max_width, length + 2))
+
+
+def _style_excel_sheet(ws, freeze="A2"):
+    if not OPENPYXL_AVAILABLE:
+        return
+    ws.freeze_panes = freeze
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    _excel_autofit(ws)
+
+
+def build_pro_excel_report(meeting, rows, ended_at):
+    """Create the Pro meeting workbook with attendance and named poll results."""
+    if not OPENPYXL_AVAILABLE:
+        raise RuntimeError(
+            "openpyxl is not installed. Add `openpyxl>=3.1.5` to requirements.txt."
+        )
+
+    workbook = Workbook()
+    overview = workbook.active
+    overview.title = "Meeting Overview"
+
+    polls = sorted(meeting.get("polls", {}).values(), key=lambda p: int(p["id"]))
+    total_votes = sum(len(poll.get("votes", {})) for poll in polls)
+    overview_rows = [
+        ("Field", "Value"),
+        ("Meeting", meeting["name"]),
+        ("Voice / Stage Channel", meeting["channel_name"]),
+        ("Started UTC", meeting["started_at"].isoformat()),
+        ("Ended UTC", ended_at.isoformat()),
+        ("Duration (minutes)", round((ended_at - meeting["started_at"]).total_seconds() / 60, 2)),
+        ("Plan", "PRO"),
+        ("Attendees tracked", len(rows)),
+        ("Polls conducted", len(polls)),
+        ("Total poll responses", total_votes),
+        ("Voting mode", "Named; one active vote per attendee per poll"),
+    ]
+    for row in overview_rows:
+        overview.append(row)
+    _style_excel_sheet(overview)
+
+    # Attendance sheet with poll participation stats.
+    attendance = workbook.create_sheet("Attendance")
+    attendance_headers = [
+        "Discord User ID",
+        "Display Name",
+        "Username",
+        "Minutes Attended",
+        "Attendance %",
+        "Polls Answered",
+        "Poll Participation %",
+    ]
+    attendance.append(attendance_headers)
+    for row in rows:
+        uid = int(row["discord_user_id"])
+        answered = sum(1 for poll in polls if uid in poll.get("votes", {}))
+        participation = (answered / len(polls) * 100.0) if polls else 0.0
+        attendance.append([
+            str(uid),
+            row["display_name"],
+            row["username"],
+            row["minutes_attended"],
+            row["attendance_percent"],
+            answered,
+            round(participation, 2),
+        ])
+    _style_excel_sheet(attendance)
+
+    # One row per answer option so totals remain easy to filter/pivot.
+    summary = workbook.create_sheet("Poll Summary")
+    summary.append([
+        "Poll ID",
+        "Question",
+        "Status",
+        "Option",
+        "Votes",
+        "Percent",
+        "Respondents",
+        "Created UTC",
+        "Closed UTC",
+    ])
+    for poll in polls:
+        counts = _poll_counts(poll)
+        total = sum(counts)
+        for index, option in enumerate(poll["options"]):
+            count = counts[index]
+            pct = (count / total * 100.0) if total else 0.0
+            summary.append([
+                poll["id"],
+                poll["question"],
+                "Open" if poll.get("open") else "Closed",
+                option,
+                count,
+                round(pct, 2),
+                total,
+                poll["created_at"].isoformat() if poll.get("created_at") else "",
+                poll["closed_at"].isoformat() if poll.get("closed_at") else "",
+            ])
+    _style_excel_sheet(summary)
+
+    # Exact voter-level data requested by the user.
+    voter_detail = workbook.create_sheet("Voter Detail")
+    voter_detail.append([
+        "Poll ID",
+        "Question",
+        "Discord User ID",
+        "Display Name",
+        "Username",
+        "Selected Option",
+        "Voted UTC",
+    ])
+    for poll in polls:
+        votes = sorted(
+            poll.get("votes", {}).values(),
+            key=lambda vote: (
+                vote.get("display_name", "").casefold(),
+                int(vote.get("discord_user_id", 0)),
+            ),
+        )
+        for vote in votes:
+            voter_detail.append([
+                poll["id"],
+                poll["question"],
+                str(vote["discord_user_id"]),
+                vote["display_name"],
+                vote["username"],
+                vote["option"],
+                vote["voted_at"].isoformat() if vote.get("voted_at") else "",
+            ])
+    _style_excel_sheet(voter_detail)
+
+    # Matrix-style sheet makes non-voters visible without losing voter detail.
+    participation = workbook.create_sheet("Poll Participation")
+    participation.append([
+        "Poll ID",
+        "Question",
+        "Discord User ID",
+        "Display Name",
+        "Username",
+        "Vote Status",
+        "Selected Option",
+    ])
+    for poll in polls:
+        for row in rows:
+            uid = int(row["discord_user_id"])
+            vote = poll.get("votes", {}).get(uid)
+            participation.append([
+                poll["id"],
+                poll["question"],
+                str(uid),
+                row["display_name"],
+                row["username"],
+                "Voted" if vote else "Did not vote",
+                vote["option"] if vote else "",
+            ])
+    _style_excel_sheet(participation)
+
+    report_path = meeting["recording_dir"] / (
+        f"{safe_filename(meeting['name'])}_meeting_report.xlsx"
+    )
+    workbook.save(report_path)
+    return report_path
+
+
 async def send_recording_files(channel, meeting):
     """
     Send one combined meeting recording instead of one WAV per speaker.
@@ -3382,6 +3612,10 @@ async def finalize_recording(
 
     ended_at = utcnow()
 
+    # Polls are part of the recorded meeting lifecycle. Closing the meeting
+    # closes every still-open poll and disables its voting buttons.
+    await close_all_meeting_polls(guild, meeting)
+
     for participant in meeting["participants"].values():
         if participant["joined_at"] is not None:
             participant["seconds"] += (
@@ -3469,6 +3703,18 @@ async def finalize_recording(
             writer.writeheader()
             writer.writerows(rows)
 
+        plan = meeting.get("plan") or await get_guild_plan(guild_id)
+        report_path = attendance_path
+        if plan == "PRO":
+            try:
+                report_path = build_pro_excel_report(meeting, rows, ended_at)
+            except Exception as e:
+                print(
+                    "Pro Excel report generation failed; using CSV fallback: "
+                    f"{type(e).__name__}: {e}"
+                )
+                report_path = attendance_path
+
         if rows:
             attendance_summary = "\n".join(
                 f"• **{row['display_name']}** — "
@@ -3478,8 +3724,6 @@ async def finalize_recording(
             )
         else:
             attendance_summary = "No attendees recorded."
-
-        plan = meeting.get("plan") or await get_guild_plan(guild_id)
 
         if stop_reason == "limit":
             reason_text = (
@@ -3496,6 +3740,7 @@ async def finalize_recording(
 
         if plan == "PRO":
             next_step_text = (
+                "📊 The Pro Excel meeting report is attached with attendance and poll results.\n"
                 "⏳ Audio recording stopped. I am now transcribing "
                 "the meeting and generating the AI summary."
             )
@@ -3512,7 +3757,7 @@ async def finalize_recording(
             f"{reason_text}\n"
             f"{attendance_summary}\n\n"
             f"{next_step_text}",
-            file=discord.File(attendance_path),
+            file=discord.File(report_path),
         )
 
         try:
@@ -3646,6 +3891,366 @@ async def recording_limit_worker(guild_id: int):
             f"Recording limit worker failed for guild {guild_id}: "
             f"{type(e).__name__}: {e}"
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Pro meeting polls
+# ---------------------------------------------------------------------------
+
+poll_group = app_commands.Group(
+    name="poll",
+    description="Pro meeting polls with named voter reporting",
+)
+
+
+def _poll_counts(poll):
+    counts = [0] * len(poll["options"])
+    for vote in poll["votes"].values():
+        index = int(vote["option_index"])
+        if 0 <= index < len(counts):
+            counts[index] += 1
+    return counts
+
+
+def _latest_poll(meeting, *, open_only=False):
+    polls = list(meeting.get("polls", {}).values())
+    if open_only:
+        polls = [poll for poll in polls if poll.get("open")]
+    if not polls:
+        return None
+    return max(polls, key=lambda poll: int(poll["id"]))
+
+
+def build_poll_embed(poll):
+    counts = _poll_counts(poll)
+    total = sum(counts)
+    state = "OPEN" if poll.get("open") else "CLOSED"
+    embed = discord.Embed(
+        title=f"🗳️ Poll #{poll['id']} — {state}",
+        description=(
+            f"**{poll['question']}**\n\n"
+            "Votes are **named** and will be included in the Pro meeting report. "
+            "You can change your vote while the poll is open."
+        ),
+    )
+    for index, option in enumerate(poll["options"]):
+        count = counts[index]
+        pct = (count / total * 100.0) if total else 0.0
+        embed.add_field(
+            name=f"{index + 1}. {option}",
+            value=f"**{count}** vote{'s' if count != 1 else ''} · {pct:.1f}%",
+            inline=False,
+        )
+    embed.set_footer(
+        text=f"{total} respondent{'s' if total != 1 else ''} · Poll #{poll['id']}"
+    )
+    return embed
+
+
+class MeetingPollButton(discord.ui.Button):
+    def __init__(self, guild_id: int, poll_id: int, option_index: int, label: str, *, disabled=False):
+        style_cycle = [
+            discord.ButtonStyle.primary,
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.success,
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.primary,
+        ]
+        super().__init__(
+            label=f"{option_index + 1}. {label}"[:80],
+            style=style_cycle[option_index % len(style_cycle)],
+            custom_id=f"frost_poll:{guild_id}:{poll_id}:{option_index}",
+            disabled=disabled,
+        )
+        self.guild_id = guild_id
+        self.poll_id = poll_id
+        self.option_index = option_index
+
+    async def callback(self, interaction: discord.Interaction):
+        meeting = active_meetings.get(self.guild_id)
+        if meeting is None:
+            await interaction.response.send_message(
+                "This meeting is no longer active.",
+                ephemeral=True,
+            )
+            return
+
+        poll = meeting.get("polls", {}).get(self.poll_id)
+        if poll is None or not poll.get("open"):
+            await interaction.response.send_message(
+                "This poll is closed.",
+                ephemeral=True,
+            )
+            return
+
+        # Only people who have actually participated in the tracked meeting
+        # can vote. A member may vote after leaving as long as they attended.
+        if interaction.user.id not in meeting.get("participants", {}):
+            await interaction.response.send_message(
+                "Join the active meeting at least once before voting in its poll.",
+                ephemeral=True,
+            )
+            return
+
+        option = poll["options"][self.option_index]
+        previous = poll["votes"].get(interaction.user.id)
+        poll["votes"][interaction.user.id] = {
+            "discord_user_id": interaction.user.id,
+            "display_name": getattr(interaction.user, "display_name", interaction.user.name),
+            "username": interaction.user.name,
+            "option_index": self.option_index,
+            "option": option,
+            "voted_at": utcnow(),
+        }
+
+        try:
+            await interaction.message.edit(
+                embed=build_poll_embed(poll),
+                view=MeetingPollView(
+                    self.guild_id,
+                    self.poll_id,
+                    poll["options"],
+                    disabled=False,
+                ),
+            )
+        except Exception as e:
+            print(f"Could not refresh poll message: {type(e).__name__}: {e}")
+
+        changed = previous is not None and previous.get("option_index") != self.option_index
+        await interaction.response.send_message(
+            (
+                f"✅ Vote {'updated' if changed else 'recorded'}: **{option}**\n"
+                "Your name and vote will appear in the meeting's Pro Excel report."
+            ),
+            ephemeral=True,
+        )
+
+
+class MeetingPollView(discord.ui.View):
+    def __init__(self, guild_id: int, poll_id: int, options, *, disabled=False):
+        super().__init__(timeout=None)
+        for index, option in enumerate(options):
+            self.add_item(
+                MeetingPollButton(
+                    guild_id,
+                    poll_id,
+                    index,
+                    option,
+                    disabled=disabled,
+                )
+            )
+
+
+async def refresh_poll_message(guild: discord.Guild, poll, *, disabled=False):
+    channel = guild.get_channel(poll.get("channel_id"))
+    if channel is None or poll.get("message_id") is None:
+        return
+    try:
+        message = await channel.fetch_message(poll["message_id"])
+        await message.edit(
+            embed=build_poll_embed(poll),
+            view=MeetingPollView(
+                guild.id,
+                poll["id"],
+                poll["options"],
+                disabled=disabled,
+            ),
+        )
+    except Exception as e:
+        print(
+            f"Could not update poll #{poll.get('id')}: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+async def close_meeting_poll(guild: discord.Guild, poll):
+    if not poll.get("open"):
+        return
+    poll["open"] = False
+    poll["closed_at"] = utcnow()
+    await refresh_poll_message(guild, poll, disabled=True)
+
+
+async def close_all_meeting_polls(guild: discord.Guild, meeting):
+    for poll in meeting.get("polls", {}).values():
+        if poll.get("open"):
+            await close_meeting_poll(guild, poll)
+
+
+class PollCreateModal(discord.ui.Modal, title="Create Pro Meeting Poll"):
+    question = discord.ui.TextInput(
+        label="Question",
+        placeholder="Should we proceed with the migration?",
+        max_length=200,
+    )
+    options_text = discord.ui.TextInput(
+        label="Options — one per line (2–10)",
+        placeholder="Yes\nNo\nAbstain",
+        style=discord.TextStyle.paragraph,
+        min_length=3,
+        max_length=800,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        meeting = active_meetings.get(self.guild_id)
+        if meeting is None:
+            await interaction.response.send_message(
+                "Start a recorded meeting with `/record start` before creating a poll.",
+                ephemeral=True,
+            )
+            return
+
+        if meeting.get("plan") != "PRO" and not await is_pro_guild(self.guild_id):
+            await interaction.response.send_message(
+                "💎 **Meeting polls are a Frost Scribe Pro feature.**",
+                ephemeral=True,
+            )
+            return
+
+        options = []
+        for raw in str(self.options_text.value).splitlines():
+            option = raw.strip().lstrip("•-").strip()
+            if option and option.casefold() not in {item.casefold() for item in options}:
+                options.append(option)
+
+        if not 2 <= len(options) <= 10:
+            await interaction.response.send_message(
+                "Enter between **2 and 10 unique options**, one option per line.",
+                ephemeral=True,
+            )
+            return
+
+        if any(len(option) > 75 for option in options):
+            await interaction.response.send_message(
+                "Keep each poll option to **75 characters or fewer**.",
+                ephemeral=True,
+            )
+            return
+
+        poll_id = int(meeting.get("next_poll_id", 1))
+        meeting["next_poll_id"] = poll_id + 1
+        poll = {
+            "id": poll_id,
+            "question": str(self.question.value).strip(),
+            "options": options,
+            "votes": {},
+            "open": True,
+            "created_at": utcnow(),
+            "closed_at": None,
+            "created_by": interaction.user.id,
+            "channel_id": interaction.channel.id,
+            "message_id": None,
+        }
+        meeting.setdefault("polls", {})[poll_id] = poll
+
+        await interaction.response.send_message(
+            embed=build_poll_embed(poll),
+            view=MeetingPollView(self.guild_id, poll_id, options),
+        )
+        try:
+            message = await interaction.original_response()
+            poll["message_id"] = message.id
+        except Exception as e:
+            print(f"Could not store poll message id: {type(e).__name__}: {e}")
+
+
+async def _get_poll_for_command(interaction: discord.Interaction, poll_id: int | None, *, open_only=False):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used inside a server.",
+            ephemeral=True,
+        )
+        return None, None
+
+    meeting = active_meetings.get(interaction.guild.id)
+    if meeting is None:
+        await interaction.response.send_message(
+            "There is no active recorded meeting.",
+            ephemeral=True,
+        )
+        return None, None
+
+    if meeting.get("plan") != "PRO" and not await is_pro_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "💎 **Meeting polls are a Frost Scribe Pro feature.**",
+            ephemeral=True,
+        )
+        return None, None
+
+    if poll_id is None:
+        poll = _latest_poll(meeting, open_only=open_only)
+    else:
+        poll = meeting.get("polls", {}).get(poll_id)
+        if open_only and poll is not None and not poll.get("open"):
+            poll = None
+
+    if poll is None:
+        await interaction.response.send_message(
+            "No matching poll was found for this active meeting.",
+            ephemeral=True,
+        )
+        return meeting, None
+
+    return meeting, poll
+
+
+@poll_group.command(name="create", description="Create a Pro poll for the active recorded meeting")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def poll_create(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    meeting = active_meetings.get(interaction.guild.id)
+    if meeting is None:
+        await interaction.response.send_message(
+            "Start a recorded meeting with `/record start` before creating a poll.",
+            ephemeral=True,
+        )
+        return
+
+    if meeting.get("plan") != "PRO" and not await is_pro_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "💎 **Meeting polls are a Frost Scribe Pro feature.**",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(PollCreateModal(interaction.guild.id))
+
+
+@poll_group.command(name="status", description="View results for a poll in the active meeting")
+@app_commands.describe(poll_id="Poll number; leave blank for the latest poll")
+async def poll_status(interaction: discord.Interaction, poll_id: int | None = None):
+    meeting, poll = await _get_poll_for_command(interaction, poll_id)
+    if poll is None:
+        return
+    await interaction.response.send_message(
+        embed=build_poll_embed(poll),
+        ephemeral=True,
+    )
+
+
+@poll_group.command(name="close", description="Close a Pro meeting poll early")
+@app_commands.describe(poll_id="Poll number; leave blank for the latest open poll")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def poll_close(interaction: discord.Interaction, poll_id: int | None = None):
+    meeting, poll = await _get_poll_for_command(interaction, poll_id, open_only=True)
+    if poll is None:
+        return
+    await close_meeting_poll(interaction.guild, poll)
+    await interaction.response.send_message(
+        f"✅ Poll #{poll['id']} closed with **{len(poll['votes'])}** respondent(s).",
+        ephemeral=True,
+    )
 
 
 record_group = app_commands.Group(
@@ -3805,6 +4410,8 @@ async def meeting_start(
         "limit_minutes": limit_minutes,
         "command_channel_id": interaction.channel.id,
         "limit_task": None,
+        "polls": {},
+        "next_poll_id": 1,
     }
 
     for member in channel.members:
@@ -3818,7 +4425,9 @@ async def meeting_start(
 
     ai_note = (
         "💎 **Pro AI enabled:** This recording will also be transcribed "
-        "and summarized after `/record stop`."
+        "and summarized after `/record stop`.\n"
+        "🗳️ **Pro Polls enabled:** Use `/poll create` during the meeting; "
+        "named voter results will be included in the final Excel report."
         if plan == "PRO"
         else
         f"❄️ **Free recording:** Audio and attendance are being captured for up to "
@@ -4011,6 +4620,7 @@ bot.tree.add_command(plan_group)
 bot.tree.add_command(attendance_group)
 bot.tree.add_command(schedule_group)
 bot.tree.add_command(record_group)
+bot.tree.add_command(poll_group)
 
 if not TOKEN:
     raise RuntimeError(
