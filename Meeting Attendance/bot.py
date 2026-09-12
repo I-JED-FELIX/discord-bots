@@ -1,4 +1,4 @@
-# Frost Scribe V18 — public poll reports
+# Frost Scribe V19 — Discord-native poll result summaries
 # Frost Scribe V16 — AI Excel Dashboard + Standalone Pro Polls + Stage Audio
 import os
 import csv
@@ -4598,6 +4598,88 @@ def build_poll_embed(poll):
     return embed
 
 
+def build_poll_results_embed(poll):
+    """Build a public Discord-native final result summary for one poll.
+
+    The embed is intentionally self-contained so members can understand the
+    result without downloading the Excel workbook. The workbook remains
+    attached as the full named-voter audit/export.
+    """
+    counts = _poll_counts(poll)
+    total = sum(counts)
+
+    if total:
+        top_count = max(counts)
+        leaders = [
+            poll["options"][index]
+            for index, count in enumerate(counts)
+            if count == top_count
+        ]
+        if len(leaders) == 1:
+            outcome = f"🏆 **Top result:** {leaders[0]} — {top_count}/{total} vote(s)"
+        else:
+            outcome = (
+                "🤝 **Tie:** " + " · ".join(leaders) +
+                f" — {top_count}/{total} vote(s) each"
+            )
+    else:
+        outcome = "No votes were cast."
+
+    linked_meeting = poll.get("linked_meeting_name")
+    context = (
+        f"Meeting: **{linked_meeting}**\n"
+        if linked_meeting
+        else "Standalone poll\n"
+    )
+
+    embed = discord.Embed(
+        title=f"📊 Poll #{poll['id']} — Final Results",
+        description=(
+            f"**{poll['question']}**\n\n"
+            f"{context}"
+            f"👥 **Respondents:** {total}\n"
+            f"{outcome}"
+        ),
+    )
+
+    votes_by_option = {index: [] for index in range(len(poll["options"]))}
+    for vote in poll.get("votes", {}).values():
+        index = int(vote.get("option_index", -1))
+        if index in votes_by_option:
+            votes_by_option[index].append(
+                vote.get("display_name") or vote.get("username") or str(vote.get("discord_user_id"))
+            )
+
+    for index, option in enumerate(poll["options"]):
+        count = counts[index]
+        pct = (count / total * 100.0) if total else 0.0
+        names = sorted(votes_by_option.get(index, []), key=str.casefold)
+        voter_text = ", ".join(names) if names else "No voters"
+        # Keep the entire embed safely below Discord's limits even for large polls.
+        if len(voter_text) > 320:
+            visible = voter_text[:317].rsplit(",", 1)[0].rstrip()
+            shown_names = [n for n in names if n in visible]
+            remaining = max(0, len(names) - len(shown_names))
+            voter_text = f"{visible} … (+{remaining} more)"
+
+        embed.add_field(
+            name=f"{index + 1}. {option}",
+            value=(
+                f"**{count} vote{'s' if count != 1 else ''} · {pct:.1f}%**\n"
+                f"👤 {voter_text}"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=(
+            "Named results are shown here. The attached Excel file contains "
+            "the complete voter audit/export."
+        )
+    )
+    return embed
+
+
 def build_poll_excel_report(guild: discord.Guild, poll):
     """Create a standalone Excel report for one poll, including named voters."""
     if not OPENPYXL_AVAILABLE:
@@ -4964,8 +5046,11 @@ async def poll_close(interaction: discord.Interaction, poll_id: int | None = Non
     try:
         report_path = build_poll_excel_report(interaction.guild, poll)
         await interaction.response.send_message(
-            f"✅ Poll #{poll['id']} closed with **{len(poll['votes'])}** respondent(s).\n"
-            "📊 Named-voter Excel report attached for everyone in this channel.",
+            embed=build_poll_results_embed(poll),
+            content=(
+                f"✅ Poll #{poll['id']} closed. "
+                "The result summary is shown below; the Excel file is the full audit report."
+            ),
             file=discord.File(str(report_path), filename=report_path.name),
         )
     except Exception as e:
@@ -4987,7 +5072,11 @@ async def poll_report(interaction: discord.Interaction, poll_id: int | None = No
     try:
         report_path = build_poll_excel_report(interaction.guild, poll)
         await interaction.response.send_message(
-            f"📊 **Poll #{poll['id']} Excel report** — visible to everyone in this channel",
+            embed=build_poll_results_embed(poll),
+            content=(
+                f"📊 **Poll #{poll['id']} report** — results are visible here in Discord; "
+                "Excel is attached for the full named-voter export."
+            ),
             file=discord.File(str(report_path), filename=report_path.name),
         )
     except Exception as e:
