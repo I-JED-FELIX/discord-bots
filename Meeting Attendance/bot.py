@@ -1,9 +1,11 @@
-# Frost Scribe V11 — Stage/Conference + DAVE Receive Fix
+# Frost Scribe V12 — Stage/Conference + DAVE + Single Meeting Audio
 import os
 import csv
 import asyncio
 import threading
+import time
 import wave
+from array import array
 import json
 import hmac
 import hashlib
@@ -432,29 +434,134 @@ def current_seconds(participant):
 
 class PerSpeakerWaveSink(voice_recv.AudioSink):
     """
-    Records decoded Discord PCM into one WAV file per speaker.
+    Capture decoded Discord PCM in two forms:
 
-    discord-ext-voice-recv currently does not reliably mix/fill silence for
-    multiple speakers, so separate files are safer and also preserve speaker
-    identity for transcription.
+    1. Temporary per-speaker WAV tracks, retained only for Pro transcription
+       so Frost Scribe can still produce higher-quality speaker-aware notes.
+    2. One compact mixed meeting WAV for the Discord user-facing recording.
+
+    The mixed track uses 20 ms time buckets. Packets that overlap in time are
+    mixed together with 16-bit saturation. Long periods with nobody speaking
+    are capped to a short pause so the exported file stays reasonably small.
     """
 
     CHANNELS = 2
     SAMPLE_WIDTH = 2
     SAMPLE_RATE = 48000
+    MIX_SLOT_SECONDS = 0.020
+    MIX_SLOT_FRAMES = int(SAMPLE_RATE * MIX_SLOT_SECONDS)  # 960 frames
+    MIX_SLOT_BYTES = MIX_SLOT_FRAMES * CHANNELS * SAMPLE_WIDTH
+    MIX_JITTER_SLOTS = 10  # ~200 ms reorder/jitter allowance
+    MAX_SILENCE_SLOTS = 50  # preserve at most ~1 second of dead air per gap
 
     def __init__(self, folder: Path):
         super().__init__()
         self.folder = folder
         self.folder.mkdir(parents=True, exist_ok=True)
+
+        # Internal speaker tracks. These are not uploaded to Discord in V12;
+        # they are used only for Pro speaker-aware transcription/summaries.
         self._writers = {}
         self.paths = {}
         self.speaker_names = {}
+
+        # User-facing single meeting recording.
+        self.combined_path = self.folder / "meeting_audio.wav"
+        self._mix_writer = wave.open(str(self.combined_path), "wb")
+        self._mix_writer.setnchannels(self.CHANNELS)
+        self._mix_writer.setsampwidth(self.SAMPLE_WIDTH)
+        self._mix_writer.setframerate(self.SAMPLE_RATE)
+        self._mix_started = time.monotonic()
+        self._mix_slots = {}
+        self._mix_last_written_slot = None
+        self._user_rtp_bases = {}
+
         self._lock = threading.Lock()
         self.closed = False
 
     def wants_opus(self) -> bool:
         return False
+
+    @staticmethod
+    def _mix_pcm(existing: bytes | None, incoming: bytes) -> bytes:
+        """Mix two little-endian signed 16-bit PCM buffers with saturation."""
+        if not existing:
+            return bytes(incoming)
+
+        left = array("h")
+        left.frombytes(existing)
+        right = array("h")
+        right.frombytes(incoming)
+
+        if len(left) < len(right):
+            left.extend([0] * (len(right) - len(left)))
+        elif len(right) < len(left):
+            right.extend([0] * (len(left) - len(right)))
+
+        for i in range(len(left)):
+            sample = left[i] + right[i]
+            if sample > 32767:
+                sample = 32767
+            elif sample < -32768:
+                sample = -32768
+            left[i] = sample
+
+        return left.tobytes()
+
+    def _wall_slot(self) -> int:
+        elapsed = max(0.0, time.monotonic() - self._mix_started)
+        return int(elapsed / self.MIX_SLOT_SECONDS)
+
+    def _packet_slot(self, uid: int, data, pcm: bytes) -> int:
+        """
+        Place one user's packet on the shared meeting timeline.
+
+        RTP timestamps preserve gaps within that user's speech. The first RTP
+        packet is anchored to the meeting wall clock so separate speakers line
+        up on one shared timeline. If packet metadata is unavailable, fall back
+        to the current wall-clock slot.
+        """
+        now_slot = self._wall_slot()
+        packet = getattr(data, "packet", None)
+        timestamp = getattr(packet, "timestamp", None)
+
+        if timestamp is None:
+            return now_slot
+
+        timestamp = int(timestamp) & 0xFFFFFFFF
+        base = self._user_rtp_bases.get(uid)
+        if base is None:
+            self._user_rtp_bases[uid] = (timestamp, now_slot)
+            return now_slot
+
+        base_timestamp, base_slot = base
+        delta_frames = (timestamp - base_timestamp) & 0xFFFFFFFF
+
+        # RTP audio timestamps are expressed in 48 kHz sample frames.
+        delta_slots = int(round(delta_frames / self.MIX_SLOT_FRAMES))
+        return max(0, base_slot + delta_slots)
+
+    def _flush_mix_slots_locked(self, cutoff_slot: int | None = None):
+        if cutoff_slot is None:
+            ready = sorted(self._mix_slots)
+        else:
+            ready = sorted(
+                slot for slot in self._mix_slots if slot <= cutoff_slot
+            )
+
+        for slot in ready:
+            pcm = self._mix_slots.pop(slot)
+
+            if self._mix_last_written_slot is not None:
+                missing = slot - self._mix_last_written_slot - 1
+                if missing > 0:
+                    silence_slots = min(missing, self.MAX_SILENCE_SLOTS)
+                    self._mix_writer.writeframes(
+                        b"\x00" * (silence_slots * self.MIX_SLOT_BYTES)
+                    )
+
+            self._mix_writer.writeframes(pcm)
+            self._mix_last_written_slot = slot
 
     def write(self, user, data):
         if self.closed:
@@ -470,6 +577,7 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
         speaker = getattr(user, "display_name", str(user))
 
         with self._lock:
+            # Keep temporary per-speaker tracks for Pro AI processing.
             if uid not in self._writers:
                 path = self.folder / (
                     f"{uid}_{safe_filename(speaker)}.wav"
@@ -485,11 +593,37 @@ class PerSpeakerWaveSink(voice_recv.AudioSink):
 
             self._writers[uid].writeframes(pcm)
 
+            # Build one compact chronological meeting track.
+            slot = self._packet_slot(uid, data, pcm)
+            self._mix_slots[slot] = self._mix_pcm(
+                self._mix_slots.get(slot), pcm
+            )
+
+            # Keep a small jitter window before committing audio to disk.
+            cutoff = self._wall_slot() - self.MIX_JITTER_SLOTS
+            if cutoff >= 0:
+                self._flush_mix_slots_locked(cutoff)
+
     def cleanup(self):
         with self._lock:
             if self.closed:
                 return
             self.closed = True
+
+            # Flush the final mixed packets and close the combined recording.
+            try:
+                self._flush_mix_slots_locked()
+            except Exception as e:
+                print(
+                    "Combined recording flush failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            try:
+                self._mix_writer.close()
+            except Exception:
+                pass
+
             for writer in self._writers.values():
                 try:
                     writer.close()
@@ -3153,45 +3287,61 @@ async def before_scheduled_reminder_worker():
 
 
 async def send_recording_files(channel, meeting):
-    """Send captured per-speaker WAV files in manageable chunks."""
+    """
+    Send one combined meeting recording instead of one WAV per speaker.
+
+    Internal per-speaker tracks remain temporary and are used only for Pro AI
+    transcription. If the combined WAV exceeds the upload-safe chunk size, it
+    is split into sequential parts as a fallback.
+    """
     sink = meeting.get("audio_sink")
     if sink is None:
         return 0
 
-    paths = []
-    for uid, path in sink.paths.items():
-        if not path.exists() or path.stat().st_size <= 44:
-            continue
-
-        try:
-            parts = split_wav_if_needed(path)
-        except Exception as e:
-            print(
-                f"Could not prepare recording for {uid}: "
-                f"{type(e).__name__}: {e}"
-            )
-            continue
-
-        paths.extend(parts)
-
-    if not paths:
+    path = getattr(sink, "combined_path", None)
+    if path is None or not path.exists() or path.stat().st_size <= 44:
         await channel.send(
-            "🎙️ No usable audio files were captured for this recording."
+            "🎙️ No usable audio was captured for this recording."
+        )
+        return 0
+
+    try:
+        parts = split_wav_if_needed(path)
+    except Exception as e:
+        print(
+            "Could not prepare combined recording: "
+            f"{type(e).__name__}: {e}"
+        )
+        await channel.send(
+            "⚠️ The meeting audio was captured, but I could not prepare it "
+            "for upload."
         )
         return 0
 
     sent = 0
-    for start in range(0, len(paths), 8):
-        batch_paths = paths[start:start + 8]
-        files = [
-            discord.File(p, filename=p.name)
-            for p in batch_paths
-        ]
+    if len(parts) == 1:
         await channel.send(
-            "🎙️ **Recording file(s)**",
-            files=files,
+            "🎙️ **Meeting recording**",
+            file=discord.File(parts[0], filename=(
+                f"{safe_filename(meeting['name'])}_recording.wav"
+            )),
         )
-        sent += len(files)
+        return 1
+
+    # Very long/high-speech meetings can exceed Discord's attachment size.
+    # They are still one combined recording logically, delivered in order.
+    for index, part in enumerate(parts, start=1):
+        await channel.send(
+            f"🎙️ **Meeting recording — part {index}/{len(parts)}**",
+            file=discord.File(
+                part,
+                filename=(
+                    f"{safe_filename(meeting['name'])}_recording_"
+                    f"part{index:03d}.wav"
+                ),
+            ),
+        )
+        sent += 1
 
     return sent
 
@@ -3351,7 +3501,7 @@ async def finalize_recording(
             )
         else:
             next_step_text = (
-                "🎙️ Audio recording stopped. Recording files are attached below.\n"
+                "🎙️ Audio recording stopped. The combined meeting recording is attached below.\n"
                 "💎 Upgrade to **Frost Scribe Pro** for transcription and AI summaries."
             )
 
@@ -3369,7 +3519,7 @@ async def finalize_recording(
             await send_recording_files(output_channel, meeting)
         except Exception as e:
             await output_channel.send(
-                "⚠️ I could not upload one or more recording files.\n"
+                "⚠️ I could not upload the combined meeting recording.\n"
                 f"`{type(e).__name__}: {e}`"
             )
 
