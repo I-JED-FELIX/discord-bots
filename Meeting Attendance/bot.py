@@ -1,4 +1,4 @@
-# Frost Scribe V8 — Stage/Conference Channel Support
+# Frost Scribe V9 — Stage/Conference Diagnostics
 import os
 import csv
 import asyncio
@@ -8,6 +8,7 @@ import json
 import hmac
 import hashlib
 import shutil
+import traceback
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from pathlib import Path
@@ -3492,10 +3493,20 @@ async def meeting_start(
         voice_client.listen(sink)
 
     except Exception as e:
+        # Keep the full traceback in Railway logs. Stage-channel failures can
+        # originate inside discord.py / discord-ext-voice-recv, and the short
+        # Discord error alone is not enough to identify the failing layer.
+        print(
+            f"Recording voice connection failed for guild={guild_id} "
+            f"channel={getattr(channel, 'id', None)} "
+            f"type={type(channel).__name__}: {type(e).__name__}: {e}"
+        )
+        print(traceback.format_exc())
         sink.cleanup()
         await interaction.followup.send(
             f"❌ I could not join/record {channel.mention}.\n"
-            f"`{type(e).__name__}: {e}`"
+            f"`{type(e).__name__}: {e}`\n"
+            "The full traceback has been written to the Railway logs."
         )
         return
 
