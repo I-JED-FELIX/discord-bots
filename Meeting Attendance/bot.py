@@ -49,7 +49,7 @@ PUBLIC_BOT_INVITE_URL = os.getenv("PUBLIC_BOT_INVITE_URL")
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID") or GUILD_ID
 
 # Recording limits protect Railway disk/CPU from abandoned or excessively long sessions.
-FREE_RECORDING_LIMIT_MINUTES = int(os.getenv("FREE_RECORDING_LIMIT_MINUTES", "60"))
+FREE_RECORDING_LIMIT_MINUTES = int(os.getenv("FREE_RECORDING_LIMIT_MINUTES", "45"))
 PRO_RECORDING_LIMIT_MINUTES = int(os.getenv("PRO_RECORDING_LIMIT_MINUTES", "180"))
 
 DATA_DIR = Path("data")
@@ -844,6 +844,58 @@ async def mark_subscription_inactive(
     )
 
 
+async def mark_subscription_pending(
+    subscription_id: str,
+    status: str,
+    current_period_end=None,
+):
+    """Keep paid entitlement during Razorpay retry/pending states."""
+    row = await db_pool.fetchrow(
+        """
+        SELECT guild_id, billing_cycle
+        FROM guild_subscriptions
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+    )
+
+    if not row:
+        return
+
+    await db_pool.execute(
+        """
+        UPDATE guild_subscriptions
+        SET status = $2,
+            current_period_end = COALESCE($3, current_period_end),
+            updated_at = NOW()
+        WHERE subscription_id = $1
+        """,
+        subscription_id,
+        status,
+        current_period_end,
+    )
+
+    await db_pool.execute(
+        """
+        UPDATE guilds
+        SET plan = 'PRO',
+            subscription_status = $2,
+            billing_cycle = COALESCE($3, billing_cycle),
+            subscription_expires_at = COALESCE($4, subscription_expires_at),
+            entitlement_source = 'RAZORPAY',
+            razorpay_subscription_id = $5,
+            updated_at = NOW()
+        WHERE guild_id = $1
+          AND COALESCE(entitlement_source, '') <> 'LIFETIME_PROMO'
+        """,
+        row["guild_id"],
+        status,
+        row["billing_cycle"],
+        current_period_end,
+        subscription_id,
+    )
+
+
 def _unix_to_datetime(value):
     if not value:
         return None
@@ -931,10 +983,25 @@ async def razorpay_webhook(request: web.Request):
                         "active",
                         period_end,
                     )
+                elif event_type == "subscription.pending":
+                    # Razorpay is retrying a failed recurring charge.
+                    # Keep Pro during the retry window, but expose the
+                    # pending billing state in /plan billing.
+                    await mark_subscription_pending(
+                        subscription_id,
+                        "pending",
+                        period_end,
+                    )
+                elif event_type == "subscription.halted":
+                    # Razorpay exhausted payment retries. Remove paid
+                    # entitlement unless a Lifetime Promo protects it.
+                    await mark_subscription_inactive(
+                        subscription_id,
+                        "halted",
+                    )
                 elif event_type in {
                     "subscription.cancelled",
                     "subscription.completed",
-                    "subscription.expired",
                 }:
                     await mark_subscription_inactive(
                         subscription_id,
@@ -3162,6 +3229,11 @@ async def finalize_recording(
                 f"⏱️ Recording automatically stopped at the "
                 f"{meeting['limit_minutes']}-minute {plan.title()} limit.\n"
             )
+            if plan != "PRO":
+                reason_text += (
+                    f"💎 Upgrade to **Frost Scribe Pro** for up to "
+                    f"**{PRO_RECORDING_LIMIT_MINUTES} minutes** per recording.\n"
+                )
         else:
             reason_text = ""
 
@@ -3272,20 +3344,32 @@ async def recording_limit_worker(guild_id: int):
             if not await still_current():
                 return
             output = await get_report_channel(guild, fallback_channel)
-            await output.send(
+            warning_text = (
                 f"⚠️ **Recording limit:** `{meeting['name']}` will "
                 "automatically stop in **10 minutes**."
             )
+            if meeting.get("plan") != "PRO":
+                warning_text += (
+                    f"\n💎 Frost Scribe Pro allows up to "
+                    f"**{PRO_RECORDING_LIMIT_MINUTES} minutes** per recording."
+                )
+            await output.send(warning_text)
 
         if limit_seconds > 60:
             await sleep_until(limit_seconds - 60)
             if not await still_current():
                 return
             output = await get_report_channel(guild, fallback_channel)
-            await output.send(
+            warning_text = (
                 f"⚠️ **Recording limit:** `{meeting['name']}` will "
                 "automatically stop in **1 minute**."
             )
+            if meeting.get("plan") != "PRO":
+                warning_text += (
+                    f"\n💎 Upgrade to Frost Scribe Pro for up to "
+                    f"**{PRO_RECORDING_LIMIT_MINUTES} minutes** per recording."
+                )
+            await output.send(warning_text)
 
         await sleep_until(limit_seconds)
         if not await still_current():
@@ -3450,8 +3534,11 @@ async def meeting_start(
         "and summarized after `/record stop`."
         if plan == "PRO"
         else
-        "❄️ **Free recording:** Audio and attendance are being captured. "
-        "AI transcription and summaries require Frost Scribe Pro."
+        f"❄️ **Free recording:** Audio and attendance are being captured for up to "
+        f"**{FREE_RECORDING_LIMIT_MINUTES} minutes**.\n"
+        f"💎 Upgrade to **Frost Scribe Pro** for up to "
+        f"**{PRO_RECORDING_LIMIT_MINUTES} minutes** per recording, plus AI transcription "
+        f"and meeting summaries."
     )
 
     await interaction.followup.send(
@@ -3523,6 +3610,14 @@ async def meeting_status(interaction: discord.Interaction):
     limit_seconds = meeting.get("limit_minutes", 0) * 60
     remaining_seconds = max(0, limit_seconds - elapsed_seconds) if limit_seconds else 0
 
+    upgrade_note = (
+        f"\n\n💎 **Free plan:** {FREE_RECORDING_LIMIT_MINUTES}-minute recording limit. "
+        f"Upgrade to **Frost Scribe Pro** for up to "
+        f"**{PRO_RECORDING_LIMIT_MINUTES} minutes** per recording + AI."
+        if meeting.get("plan") != "PRO"
+        else ""
+    )
+
     await interaction.response.send_message(
         f"📋 **{meeting['name']}**\n"
         f"🎙️ Channel: <#{meeting['channel_id']}>\n"
@@ -3531,6 +3626,7 @@ async def meeting_status(interaction: discord.Interaction):
         f"⌛ Limit: **{meeting.get('limit_minutes', '?')} min** "
         f"({format_duration(remaining_seconds)} remaining)"
         f"\n\n{body}"
+        f"{upgrade_note}"
     )
 
 
