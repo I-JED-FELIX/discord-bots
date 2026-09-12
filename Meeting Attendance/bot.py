@@ -1,3 +1,4 @@
+# Frost Scribe V18 — public poll reports
 # Frost Scribe V16 — AI Excel Dashboard + Standalone Pro Polls + Stage Audio
 import os
 import csv
@@ -4964,9 +4965,8 @@ async def poll_close(interaction: discord.Interaction, poll_id: int | None = Non
         report_path = build_poll_excel_report(interaction.guild, poll)
         await interaction.response.send_message(
             f"✅ Poll #{poll['id']} closed with **{len(poll['votes'])}** respondent(s).\n"
-            "📊 Named-voter Excel report attached.",
+            "📊 Named-voter Excel report attached for everyone in this channel.",
             file=discord.File(str(report_path), filename=report_path.name),
-            ephemeral=True,
         )
     except Exception as e:
         await interaction.response.send_message(
@@ -4987,9 +4987,8 @@ async def poll_report(interaction: discord.Interaction, poll_id: int | None = No
     try:
         report_path = build_poll_excel_report(interaction.guild, poll)
         await interaction.response.send_message(
-            f"📊 **Poll #{poll['id']} Excel report**",
+            f"📊 **Poll #{poll['id']} Excel report** — visible to everyone in this channel",
             file=discord.File(str(report_path), filename=report_path.name),
-            ephemeral=True,
         )
     except Exception as e:
         await interaction.response.send_message(
