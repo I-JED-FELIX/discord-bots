@@ -1,4 +1,4 @@
-# Frost Scribe V9 — Stage/Conference Diagnostics
+# Frost Scribe V11 — Stage/Conference + DAVE Receive Fix
 import os
 import csv
 import asyncio
@@ -66,6 +66,55 @@ except Exception as _stage_patch_error:
     print(
         "Warning: Stage video-metadata compatibility patch could not load: "
         f"{type(_stage_patch_error).__name__}: {_stage_patch_error}"
+    )
+
+# ---------------------------------------------------------------------------
+# Discord DAVE receive compatibility patch
+#
+# Some current discord-ext-voice-recv DAVE builds call
+# ``dave_session.set_passthrough_mode(...)`` unconditionally when the first
+# RTP decoder is created. On Stage channels Discord can begin delivering RTP
+# before discord.py has created a DAVE session, so dave_session is None and
+# the receive thread crashes. The rest of the library already checks whether
+# a DAVE session exists and is ready before decrypting packets.
+#
+# Preserve the upstream initializer and only recover from this exact
+# early-session None case. At the point of the upstream failure all decoder
+# fields have already been initialized except _last_seq/_last_ts, so we finish
+# those two fields and allow the receive thread to continue.
+# ---------------------------------------------------------------------------
+try:
+    from discord.ext.voice_recv import opus as _voice_recv_opus
+
+    _frost_original_packetdecoder_init = _voice_recv_opus.PacketDecoder.__init__
+
+    def _frost_packetdecoder_init(self, router, ssrc):
+        try:
+            return _frost_original_packetdecoder_init(self, router, ssrc)
+        except AttributeError as exc:
+            vc = getattr(self, "vc", None)
+            connection = getattr(vc, "_connection", None)
+            dave_session = getattr(connection, "dave_session", None)
+
+            if dave_session is None and "set_passthrough_mode" in str(exc):
+                # These are the only fields the affected upstream initializer
+                # has not assigned yet when it hits the bad DAVE call.
+                self._last_seq = -1
+                self._last_ts = -1
+                print(
+                    "Frost Scribe DAVE guard: RTP arrived before the DAVE "
+                    f"session was ready (ssrc={ssrc}); continuing safely."
+                )
+                return None
+
+            raise
+
+    _voice_recv_opus.PacketDecoder.__init__ = _frost_packetdecoder_init
+    print("Frost Scribe DAVE early-session compatibility patch loaded.")
+except Exception as _dave_patch_error:
+    print(
+        "Warning: DAVE early-session compatibility patch could not load: "
+        f"{type(_dave_patch_error).__name__}: {_dave_patch_error}"
     )
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -2616,9 +2665,17 @@ async def attendance_status(
 
     # A recorded meeting already includes attendance tracking. If there is no
     # attendance-only session, surface the recording's live attendance here too.
+    # Report the *actual* audio receiver state rather than merely the presence
+    # of a recording session so /attendance status and /record status agree.
     if session is None:
         session = active_meetings.get(guild_id)
-        recording = session is not None
+        if session is not None:
+            voice_client = session.get("voice_client")
+            recording = bool(
+                voice_client
+                and voice_client.is_connected()
+                and voice_client.is_listening()
+            )
 
     if session is None:
         await interaction.response.send_message(
@@ -3538,7 +3595,27 @@ async def meeting_start(
         voice_client = await channel.connect(
             cls=voice_recv.VoiceRecvClient
         )
-        voice_client.listen(sink)
+
+        def _recording_receive_finished(error):
+            if error is not None:
+                print(
+                    f"Voice receive stopped with error for guild={guild_id} "
+                    f"channel={channel.id}: {type(error).__name__}: {error}"
+                )
+                print(
+                    "".join(
+                        traceback.format_exception(
+                            type(error), error, error.__traceback__
+                        )
+                    )
+                )
+            else:
+                print(
+                    f"Voice receive stopped normally for guild={guild_id} "
+                    f"channel={channel.id}."
+                )
+
+        voice_client.listen(sink, after=_recording_receive_finished)
 
     except Exception as e:
         # Keep the full traceback in Railway logs. Stage-channel failures can
